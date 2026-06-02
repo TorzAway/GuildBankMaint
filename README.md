@@ -1,12 +1,12 @@
 
                                         GuildBankMaint SYSTEM DOCUMENTATION
 
-==========================================
+-- ------------
 -- GuildBankMaint
 -- Guild Bank Automation Script for MacroQuest (MQ Lua)
 -- Save as `gbank_helper.lua` in your MacroQuest `lua` folder.
 -- Run in-game with: /lua run gbank_helper
-==========================================
+-- ------------
 --
 -- OVERVIEW
 -- --------
@@ -22,4 +22,4 @@
 -- - Guild membership (officer rank required for PROMOTE and PRUNE SPELLS)
 -- - GuildManagementWnd must be openable in-game
 --
-==========================================
+-- ------------
