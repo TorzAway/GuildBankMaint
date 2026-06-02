@@ -1,9 +1,9 @@
 -- =============================================================================
--- gbank_helper.lua
+-- GuildBankMaint - Management Tool
 -- Guild Bank Automation Script for MacroQuest (MQ Lua)
--- Save as `gbank_helper.lua` in your MacroQuest `lua` folder.
+-- Save as `\GuildBankMaint\init.lua` in your MacroQuest `lua` folder.
 -- Run in-game with: /lua run gbank_helper
--- =============================================================================
+-- ==============================================================================
 --
 -- OVERVIEW
 -- --------
