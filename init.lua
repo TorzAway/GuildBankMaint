@@ -1,0 +1,1481 @@
+-- =============================================================================
+-- gbank_helper.lua
+-- Guild Bank Automation Script for MacroQuest (MQ Lua)
+-- Save as `gbank_helper.lua` in your MacroQuest `lua` folder.
+-- Run in-game with: /lua run gbank_helper
+-- =============================================================================
+--
+-- OVERVIEW
+-- --------
+-- Automates guild bank interactions for Anguish Mat farming and
+-- Spell/Song/Skill/Tome management. Provides an ImGui UI with category and
+-- mode selection, picker windows for selective withdraw/deposit, officer-only
+-- tools, and a unified colored notification system.
+--
+-- REQUIREMENTS
+-- ------------
+-- - MacroQuest with Lua and ImGui support
+-- - MQ Navigation plugin (for auto-pathing to Guild Treasurer)
+-- - Guild membership (officer rank required for PROMOTE and PRUNE SPELLS)
+-- - GuildManagementWnd must be openable in-game
+--
+-- USAGE
+-- -----
+-- 1. Run: /lua run gbank_helper
+-- 2. Open the Guild Management window before starting (for rank detection).
+-- 3. Select a Category (Anguish Mats or Spells/Songs/Skills/Tomes).
+-- 4. Select a Mode (GET to withdraw, GIVE to deposit).
+-- 5. Click SCAN GUILD BANK (GET) or SCAN INVENTORY (GIVE).
+-- 6. If the bank is not open, the script will navigate to the Guild Treasurer.
+-- 7. A picker window will appear — select items and confirm.
+--
+-- ITEM LISTS
+-- ----------
+-- itemTargetList  : Anguish Mat items matched by exact name for GET/GIVE.
+-- spellTargetList : Optional explicit spell/tome names (patterns auto-match).
+--                   EQ naming conventions auto-detected:
+--                     "Spell: *", "Song: *", "Tome of *", "Tome: *",
+--                     "Skill: *", items containing "Rk. I/II/III"
+--
+-- =============================================================================
+-- FUNCTION REFERENCE
+-- =============================================================================
+--
+-- NOTIFICATION
+-- ------------
+-- notify(tag, msg, kind)
+--   Sends a colored /echo message. tag = label shown in brackets.
+--   kind: "info"(yellow), "success"(green), "error"(red), "warn"(orange),
+--         "scan"(teal), "action"(white), "officer"(magenta)
+--
+-- MATCH HELPERS
+-- -------------
+-- activeList()
+--   Returns itemTargetList or spellTargetList based on selectedCategory.
+--
+-- isAnguishMatItem(itemName)
+--   Returns true if itemName exactly matches an entry in itemTargetList.
+--   Case-insensitive, strips leading/trailing whitespace.
+--
+-- isSpellItem(itemName)
+--   Returns true if itemName matches EQ spell/song/skill/tome naming patterns
+--   ("Spell: ", "Song: ", "Tome of ", "Tome: ", "Skill: ", "Rk. I/II/III"),
+--   or matches an explicit entry in spellTargetList.
+--
+-- isTargetItem(itemName)
+--   Routes to isAnguishMatItem or isSpellItem based on selectedCategory.
+--
+-- SHARED UTILITIES
+-- ----------------
+-- clearCursorFailsafe()
+--   Checks if an item is stuck on the cursor and calls /autoinventory.
+--   Aborts the active workflow if inventory is full. Returns true if safe.
+--
+-- handleQuantityWindow()
+--   Detects the QuantityWnd popup (stacked items), sets slider to max,
+--   and confirms. Waits up to 2 seconds for the item to reach the cursor.
+--
+-- PRUNE SPELLS ENGINE
+-- -------------------
+-- handlePruneSpells()
+--   Called each main-loop tick while isPruning is true. Walks GBANK_ItemList,
+--   identifies spell/song/skill/tome items via isSpellItem(), looks up their
+--   MinCasterLevel via mq.TLO.Spell(spellName).MinCasterLevel(), and withdraws
+--   any item below PRUNE_LEVEL_CUTOFF (default 65). Depending on pruneAction:
+--     1 = /autoinventory (keep), 2 = /destroy (discard).
+--   Yields back to the main loop after each withdrawal so slot indices
+--   are re-scanned fresh on the next tick.
+--
+-- BANK SCAN CORE
+-- --------------
+-- doScan(matchFn, windowTitle, actionLabel, mode, logTag)
+--   Internal shared scan engine. Walks GBANK_ItemList, calls matchFn() on
+--   each item name, groups stacks of the same item, and populates scanResults
+--   and selectedForWithdrawal (all unchecked by default). Sets pickerWindowTitle,
+--   pickerActionLabel, and pickerMode ("withdraw"/"deposit"). Opens the picker
+--   window if any matches are found. Does NOT move or touch any items.
+--
+-- scanBankAnguish()
+--   Calls doScan with isAnguishMatItem for the Anguish Mats GET picker.
+--
+-- scanBankSpells()
+--   Calls doScan with isSpellItem for the Spells GET picker. Looks up
+--   MinCasterLevel via Spell TLO for each match to display required level.
+--
+-- scanBankForCategory()
+--   Dispatches to scanBankAnguish or scanBankSpells based on selectedCategory.
+--
+-- scanInventorySpells()
+--   Walks bag slots 23-32 (all main packs), runs isSpellItem on each sub-slot.
+--   Looks up MinCasterLevel via FindItem + Scroll.SpellID → Spell TLO chain.
+--   Populates scanResults for the deposit picker (pickerMode = "deposit").
+--
+-- scanInventoryAnguish()
+--   Walks bag slots 23-32, runs isAnguishMatItem on each sub-slot.
+--   Populates scanResults for the deposit picker (pickerMode = "deposit").
+--
+-- scanInventoryForCategory()
+--   Dispatches to scanInventoryAnguish or scanInventorySpells.
+--
+-- PICKED WITHDRAWAL ENGINE
+-- ------------------------
+-- handlePickedWithdrawal()
+--   Called each main-loop tick while isWithdrawingPicked is true. Processes
+--   withdrawQueue one name per tick. Re-scans bank slot indices live after each
+--   withdrawal (indices shift after each removal). Calls handleQuantityWindow()
+--   for stacked items and /autoinventory after each pickup. Advances the queue
+--   only once the item is fully gone from the bank list.
+--
+-- PICKED DEPOSIT ENGINE
+-- ---------------------
+-- handlePickedDeposit()
+--   Called each main-loop tick while isDepositingPicked is true. Processes
+--   depositQueue one name per tick. Uses FindItem("=name") to locate each item
+--   in inventory, picks it up with /shift /itemnotify, then clicks
+--   GBANK_DepositButton. On queue exhaustion, calls processOfficerPublicVaultRoutines
+--   if cachedIsOfficer, then cleans up state.
+--
+-- STANDARD GET (non-picker fallback)
+-- -----------------------------------
+-- handleGetMode()
+--   Full-sweep bank withdrawal used for non-picker flows. Walks GBANK_ItemList,
+--   calls isTargetItem on each row, and withdraws the first match found per tick.
+--   Sets isRunningWorkflow = false when no more matches remain.
+--
+-- OFFICER PUBLIC VAULT ROUTINES
+-- ------------------------------
+-- processOfficerPublicVaultRoutines()
+--   Officer-only. First promotes all items in the GBANK_DepositList staging area
+--   to the main vault. Then walks every row in GBANK_ItemList, reads the
+--   permission from column 4, and changes any non-Public item to Public via
+--   GBANK_PermissionCombo listselect 4. Only called when cachedIsOfficer is true.
+--
+-- GIVE MODE (Anguish Mats sweep fallback)
+-- ----------------------------------------
+-- handleGiveMode()
+--   Legacy full-sweep deposit for Anguish Mats. Iterates activeList(), finds
+--   each item in inventory via FindItem, picks it up, and deposits it.
+--   Calls processOfficerPublicVaultRoutines on completion if officer.
+--   (Retained for compatibility; normal GIVE now uses the picker path.)
+--
+-- NAVIGATION WORKFLOW
+-- -------------------
+-- processBankWorkflow()
+--   Four-step sequenced automation:
+--     Step 1: /target npc "guild treasurer" — locates nearest treasurer.
+--     Step 2: /nav target — moves to the treasurer; waits for arrival.
+--     Step 3: /click left target — interacts to open the bank window.
+--     Step 4: Dispatches based on pending flags and selected mode:
+--               pendingPrune   → sets isPruning   = true
+--               pendingPromote → sets isPromoting  = true
+--               GET mode       → scanBankForCategory()
+--               GIVE mode      → scanInventoryForCategory()
+--
+-- PICKER WINDOW
+-- -------------
+-- pickerGUI()
+--   Renders a second floating ImGui window (independent of the main window).
+--   Displays scanResults as checkboxes, all unchecked by default.
+--   Shows a "Req. Level" column for Spells category scans.
+--   Provides Select All / Deselect All shortcuts and a scrollable list.
+--   Confirm button (label from pickerActionLabel) builds withdrawQueue or
+--   depositQueue from checked entries, sets the appropriate engine flag,
+--   and closes the window immediately.
+--
+-- GUILD RANK LOOKUP
+-- -----------------
+-- fetchGuildRank()
+--   Called once at script startup from the main loop thread (delays safe).
+--   Opens GuildManagementWnd via DoOpen() if not already open, waits up to
+--   5 seconds for GT_MemberList to populate, scans all columns of every row
+--   to find the character's own name, selects that row via listselect, waits
+--   500ms for the UI to update, then reads column 4 as the rank string.
+--   Caches result in cachedGuildRank and cachedIsOfficer (true for Officer/Leader).
+--   Closes the window again if it was opened by this function.
+--
+-- MAIN GUI
+-- --------
+-- mainGUI()
+--   ImGui render callback registered with mq.imgui.init. Renders the main
+--   "Guild Bank Automator" window on every frame. Layout (top to bottom):
+--     - Guild rank / officer status (color-coded green/orange)
+--     - PRUNE SPELLS + PROMOTE buttons (officer only, centered pair)
+--     - Prune action radio: Keep (autoinv) / Destroy
+--     - Separator
+--     - Category radio: Anguish Mats / Spells/Songs/Skills/Tomes
+--     - Separator
+--     - Mode radio: GET (Withdraw) / GIVE (Deposit)
+--     - Separator
+--     - SCAN GUILD BANK / SCAN INVENTORY / CANCEL button (centered)
+--     - Separator
+--     - Status line (color-coded by current operation)
+--     - Separator
+--     - EXIT SCRIPT button (centered, red)
+--   Also calls pickerGUI() each frame to render the picker popup if open.
+--
+-- PRIMARY EXECUTION ENGINE
+-- ------------------------
+--   Main while loop (runs while shouldDraw is true, 50ms tick).
+--   Priority order each tick:
+--     1. isWithdrawingPicked → handlePickedWithdrawal()
+--     2. isDepositingPicked  → handlePickedDeposit()
+--     3. isPruning           → handlePruneSpells()   (officer + bank open required)
+--     4. isPromoting         → processOfficerPublicVaultRoutines() (officer + bank open)
+--     5. isRunningWorkflow   → processBankWorkflow()
+--
+-- =============================================================================
+
+local mq = require('mq')
+local ImGui = require('ImGui')
+
+-- ─── Unified Notification Helper ─────────────────────────────────────────────
+-- Colors: "info"=yellow, "success"=green, "error"=red, "warn"=orange,
+--         "scan"=teal, "action"=white, "officer"=magenta
+local COLOR = {
+    info    = "\ay",  -- yellow
+    success = "\ag",  -- green
+    error   = "\ar",  -- red
+    warn    = "\ao",  -- orange
+    scan    = "\at",  -- teal
+    action  = "\aw",  -- white
+    officer = "\am",  -- magenta
+}
+local function notify(tag, msg, kind)
+    local c = COLOR[kind or "info"] or COLOR.info
+    mq.cmd(string.format("/echo %s[%s]\\ax \\ay%s\\ax", c, tag, msg))
+end
+
+-- Wraps a variable value in red brackets with green text for notifications.
+-- Usage: notify("Tag", "Found " .. hilite(count) .. " items.", "info")
+local function hilite(val)
+    return "\\am[\\ag" .. tostring(val) .. "\\am]\\ay"
+end
+
+
+-- Global script states
+local version = "4.1"
+local openGUI = true
+local shouldDraw = true
+local selectedOption = 1   -- 1 = GET, 2 = GIVE
+local selectedCategory = 1 -- 1 = Anguish Mats, 2 = Spells/Songs/Skills/Tomes
+
+-- Guild rank cache (populated once at startup from the main loop thread)
+local cachedGuildRank = "Unknown"
+local cachedIsOfficer = false
+
+-- Automation Workflow States
+local isRunningWorkflow = false
+local workflowStep = 0
+local lastActionTime = 0
+local ACTION_DELAY = 800 -- Throttle actions (ms) to prevent UI spam/disconnects
+
+-- Picker Window State (used by all scan paths)
+local showPickerWindow    = false -- controls the item selection popup
+local pickerWindowTitle   = ""    -- set by whichever scan opens the picker
+local pickerActionLabel   = ""    -- button label: "Withdraw Selected" or "Deposit Selected"
+local pickerMode          = ""    -- "withdraw" | "deposit" — drives which engine runs
+local scanResults         = {}    -- { { name=string, slots={int,...} } ... }
+local selectedForWithdrawal = {}  -- keyed by name -> bool; false = unchecked (default)
+local isWithdrawingPicked = false
+local withdrawQueue       = {}    -- ordered list of names to withdraw after confirmation
+local isDepositingPicked  = false
+local depositQueue        = {}    -- ordered list of names to deposit after confirmation
+local isPruning           = false -- true while PRUNE SPELLS withdrawal is running
+local pendingPrune        = false -- true when nav workflow should start prune at step 4
+local pruneAction         = 1    -- 1 = autoinventory, 2 = destroy
+local isPromoting         = false -- true while PROMOTE public-access sweep is running
+local pendingPromote      = false -- true when nav workflow should start promote at step 4
+local PRUNE_LEVEL_CUTOFF  = 65   -- withdraw spells below this level
+
+-- Configuration List: Anguish Mats
+local itemTargetList = {
+    "Dragorn Muramite Ring", "Ikaav Head", "Kyv Scout Ring", "Kyv Short Bow",
+    "Kyv Whetstone", "Shattered Ukun Hide", "Withered Discordling Tongue",
+    "Bar of Nashtar Berry Soap", "Ikaav Tail", "Kuuan Whetstone",
+    "Piece of Vrenlar Fruit", "Riftseeker Trinket", "Softened Feran Hide",
+    "Spool of Balemoon Silk", "Bazu Nail Bracelet", "Chimera Gut String",
+    "Discordling Hoof", "Fine Chimera Hide", "Muramite Noble's March Award",
+    "Quality Feran Hide", "Spiked Discordling Collar", "Blackened Discordling Tail",
+    "Ceremonial Dragorn Candle", "Crystal of Yearning", "Kyv Food Sack",
+    "Kyv Hunter Ring", "Large Piece of Kuuan Ore", "Noc Right Hand"
+}
+
+-- Configuration List: Spells / Songs / Skills / Tomes
+-- Optional explicit list — any entries here are matched in addition to the
+-- EQ naming-convention patterns (Spell: / Song: / Tome of / Tome: / etc.)
+local spellTargetList = {
+    -- e.g. "Spell: Example Name", "Tome of Example Discipline",
+}
+
+-- Returns the active item list based on the selected category
+local function activeList()
+    return selectedCategory == 1 and itemTargetList or spellTargetList
+end
+
+-- ─── Match Helpers ────────────────────────────────────────────────────────────
+
+-- Match against the Anguish Mats list
+local function isAnguishMatItem(itemName)
+    if not itemName or type(itemName) ~= "string" or itemName == "" then return false end
+    local clean = itemName:gsub("^%s*(.-)%s*$", "%1"):lower()
+    for _, name in ipairs(itemTargetList) do
+        if name and name:lower() == clean then return true end
+    end
+    return false
+end
+
+-- Match against EQ Spell/Song/Skill/Tome naming conventions,
+-- plus any entries explicitly added to spellTargetList.
+local function isSpellItem(itemName)
+    if not itemName or type(itemName) ~= "string" or itemName == "" then return false end
+    local clean = itemName:gsub("^%s*(.-)%s*$", "%1")
+    local lower = clean:lower()
+
+    -- EQ naming-convention patterns (case-insensitive prefix check)
+    if lower:find("^spell:%s") then return true end
+    if lower:find("^song:%s") then return true end
+    if lower:find("^tome of%s") then return true end
+    if lower:find("^tome:%s") then return true end
+    if lower:find("^skill:%s") then return true end
+    -- Catch "Rk. II / Rk. III" variants that start with "Spell:" after a rename
+    if lower:find("rk%. i") then return true end
+
+    -- Also honour explicit spellTargetList entries if populated
+    for _, name in ipairs(spellTargetList) do
+        if name and name:lower() == lower then return true end
+    end
+
+    return false
+end
+
+-- Routes to the correct match function for the current category
+local function isTargetItem(itemName)
+    if selectedCategory == 1 then
+        return isAnguishMatItem(itemName)
+    else
+        return isSpellItem(itemName)
+    end
+end
+
+-- ─── Shared Utilities ─────────────────────────────────────────────────────────
+
+-- Safely handles cursor blocks (full inventory / item stuck)
+local function clearCursorFailsafe()
+    if mq.TLO.Cursor() then
+        notify("GBank", "Item stuck on cursor. Attempting to clear...", "warn")
+        mq.cmd("/autoinventory")
+        mq.delay(400)
+        if mq.TLO.Cursor() then
+            notify("GBank", "Inventory full! Aborting script workflow.", "error")
+            isRunningWorkflow   = false
+            isWithdrawingPicked = false
+            isDepositingPicked  = false
+            workflowStep        = 0
+            return false
+        end
+    end
+    return true
+end
+
+-- Handles the Quantity Selection window if it appears for stacked items
+local function handleQuantityWindow()
+    if mq.TLO.Window('QuantityWnd').Open() then
+        notify("GBank", "Quantity window detected. Directing slider value to max...", "info")
+        mq.cmd("/notify QuantityWnd QTYW_Slider newvalue 100")
+        mq.delay(150)
+        mq.cmd("/notify QuantityWnd QTYW_Accept_Button leftmouseup")
+        mq.delay(200)
+        local timeout = os.clock() + 2.0
+        while not mq.TLO.Cursor() and os.clock() < timeout do
+            mq.delay(50)
+        end
+    end
+end
+
+-- ─── Prune Spells Engine ─────────────────────────────────────────────────────
+
+-- Walks the open guild bank, withdraws every spell/song/skill/tome whose
+-- MinCasterLevel is below PRUNE_LEVEL_CUTOFF, autoinventories each one.
+-- Runs one item per main-loop tick via isPruning flag.
+local function handlePruneSpells()
+    if not mq.TLO.Window('GuildBankWnd').Open() then
+        notify("GBank Prune", "Bank window closed. Aborting prune.", "error")
+        isPruning = false
+        return
+    end
+    if os.clock() * 1000 < lastActionTime + ACTION_DELAY then return end
+    if not clearCursorFailsafe() then
+        isPruning = false
+        return
+    end
+
+    local itemsCount = mq.TLO.Window('GuildBankWnd').Child('GBANK_ItemList').Items() or 0
+    if itemsCount == 0 then
+        notify("GBank Prune", "Bank list empty. Prune complete.", "success")
+        isPruning = false
+        return
+    end
+
+    for i = 1, itemsCount do
+        local itemText = mq.TLO.Window('GuildBankWnd').Child('GBANK_ItemList').List(i, 2)()
+        if itemText and itemText ~= "" and isSpellItem(itemText) then
+            -- Derive spell name and look up MinCasterLevel
+            local spellName = itemText
+                :gsub("^%s*(.-)%s*$", "%1")
+                :gsub("^[Ss]pell:%s*", "")
+                :gsub("^[Ss]ong:%s*", "")
+                :gsub("^[Tt]ome[: ]of%s*", "")
+                :gsub("^[Tt]ome:%s*", "")
+                :gsub("^[Ss]kill:%s*", "")
+            local spellLevel = 0
+            -- Primary: look up by stripped spell name via Spell TLO
+            local ok, result = pcall(function()
+                local spell = mq.TLO.Spell(spellName)
+                if spell and spell() then
+                    return spell.MinCasterLevel() or 0
+                end
+                return 0
+            end)
+            if ok and result and result > 0 then spellLevel = result end
+
+            -- Fallback: use Scroll.SpellID from FindItem if the name lookup failed.
+            -- FindItem won't find bank items, but for spells whose name resolves
+            -- via Spell TLO this is already handled above.
+            if spellLevel == 0 then
+                local ok2, result2 = pcall(function()
+                    local spell = mq.TLO.Spell(itemText)
+                    if spell and spell() then
+                        return spell.MinCasterLevel() or 0
+                    end
+                    return 0
+                end)
+                if ok2 and result2 and result2 > 0 then spellLevel = result2 end
+            end
+
+            if spellLevel > 0 and spellLevel < PRUNE_LEVEL_CUTOFF then
+                notify("GBank Prune", "Withdrawing " .. hilite(itemText) .. " (level " .. hilite(spellLevel) .. " < " .. hilite(PRUNE_LEVEL_CUTOFF) .. ")...", "action")
+                mq.cmd(string.format("/notify GuildBankWnd GBANK_ItemList listselect %d", i))
+                mq.delay(200)
+                mq.cmd("/notify GuildBankWnd GBANK_WithdrawButton leftmouseup")
+                mq.delay(300)
+                handleQuantityWindow()
+                lastActionTime = os.clock() * 1000
+                mq.delay(400)
+                if mq.TLO.Cursor() then
+                    if pruneAction == 2 then
+                        mq.cmd("/destroy")
+                        notify("GBank Prune", "Destroyed.", "warn")
+                    else
+                        mq.cmd("/autoinventory")
+                    end
+                    mq.delay(300)
+                end
+                return -- yield to main loop; re-scan on next tick
+            elseif spellLevel == 0 then
+                notify("GBank Prune", "Skipping " .. hilite(itemText) .. " (could not determine level).", "warn")
+            end
+        end
+    end
+
+    -- No more qualifying items found
+    notify("GBank Prune", "Prune complete. No more spells below level " .. hilite(PRUNE_LEVEL_CUTOFF) .. " in bank.", "success")
+    isPruning = false
+end
+
+-- ─── Bank Scan Core ───────────────────────────────────────────────────────────
+
+-- Internal: walks GBANK_ItemList or inventory, calls matchFn(itemName) for each row,
+-- populates scanResults / selectedForWithdrawal, sets picker metadata,
+-- and opens the picker if at least one match is found.
+-- Does NOT touch or move any items.
+local function doScan(matchFn, windowTitle, actionLabel, mode, logTag)
+    scanResults           = {}
+    selectedForWithdrawal = {}
+    pickerWindowTitle     = windowTitle
+    pickerActionLabel     = actionLabel
+    pickerMode            = mode
+
+    if not mq.TLO.Window('GuildBankWnd').Open() then
+        notify(logTag, "Guild Bank window is not open. Cannot scan.", "error")
+        return
+    end
+
+    local itemsCount = mq.TLO.Window('GuildBankWnd').Child('GBANK_ItemList').Items() or 0
+    notify(logTag, "Scanning " .. hilite(itemsCount) .. " bank slot(s)...", "scan")
+
+    for i = 1, itemsCount do
+        local itemText = mq.TLO.Window('GuildBankWnd').Child('GBANK_ItemList').List(i, 2)()
+        if itemText and itemText ~= "" then
+            if matchFn(itemText) then
+                local cleanName = itemText:gsub("^%s*(.-)%s*$", "%1")
+                -- Group stacks of the same name into one entry
+                local grouped = false
+                for _, entry in ipairs(scanResults) do
+                    if entry.name == cleanName then
+                        table.insert(entry.slots, i)
+                        grouped = true
+                        break
+                    end
+                end
+                if not grouped then
+                    local lvl = 0
+                    -- Bank items can't be found via FindItem (not in inventory).
+                    -- Instead derive the spell name from the item name prefix and
+                    -- look it up directly via the Spell TLO, which works by name.
+                    local spellName = cleanName
+                        :gsub("^[Ss]pell:%s*", "")
+                        :gsub("^[Ss]ong:%s*", "")
+                        :gsub("^[Tt]ome[: ]of%s*", "")
+                        :gsub("^[Tt]ome:%s*", "")
+                        :gsub("^[Ss]kill:%s*", "")
+                    local ok, result = pcall(function()
+                        local spell = mq.TLO.Spell(spellName)
+                        if spell and spell() then
+                            return spell.MinCasterLevel() or 0
+                        end
+                        return 0
+                    end)
+                    if ok and result and result > 0 then lvl = result end
+                    table.insert(scanResults, { name = cleanName, slots = { i }, level = lvl })
+                    selectedForWithdrawal[cleanName] = false -- unchecked by default
+                end
+            end
+        end
+    end
+
+    local found = #scanResults
+    notify(logTag, "Scan complete. " .. hilite(found) .. " unique matching item(s) found.", "success")
+
+    if found > 0 then
+        showPickerWindow = true
+    else
+        notify(logTag, "No matching items found in the bank.", "warn")
+        showPickerWindow = false
+    end
+end
+
+-- Public scan entry points — bank-side (GET mode)
+local function scanBankAnguish()
+    doScan(isAnguishMatItem,
+           "Anguish Mats - Select Items to Withdraw",
+           "Withdraw Selected",
+           "withdraw",
+           "GBank Scan: Anguish")
+end
+
+local function scanBankSpells()
+    doScan(isSpellItem,
+           "Spells / Songs / Skills / Tomes - Select Items to Withdraw",
+           "Withdraw Selected",
+           "withdraw",
+           "GBank Scan: Spells")
+end
+
+-- Dispatch to the correct scanner for the active category
+local function scanBankForCategory()
+    if selectedCategory == 1 then
+        scanBankAnguish()
+    else
+        scanBankSpells()
+    end
+end
+
+-- Inventory scan: walks all bag slots via FindItemIter, runs isSpellItem on each,
+-- populates scanResults for the deposit picker. Does NOT touch or move any items.
+local function scanInventorySpells()
+    scanResults           = {}
+    selectedForWithdrawal = {}
+    pickerWindowTitle     = "Spells / Songs / Skills / Tomes - Select Items to Deposit"
+    pickerActionLabel     = "Deposit Selected"
+    pickerMode            = "deposit"
+
+    notify("GBank Scan", "Scanning inventory bags for spells/songs/skills/tomes...", "scan")
+
+    -- EQ bag slots: 23–32 are the main pack slots (up to 10 bags).
+    -- Each bag can hold up to 10 items (sub-slots 1–10).
+    -- mq.TLO.Me.Inventory(slotName) and FindItem work for named lookups;
+    -- for a full sweep we iterate pack slots directly.
+    local found = 0
+    for bag = 23, 32 do
+        local container = mq.TLO.InvSlot(bag).Item
+        if container and container() then
+            local bagSize = container.Container() or 0
+            for slot = 1, bagSize do
+                local item = container.Item(slot)
+                if item and item() then
+                    local itemName = item.Name()
+                    if itemName and isSpellItem(itemName) then
+                        local cleanName = itemName:gsub("^%s*(.-)%s*$", "%1")
+                        -- Group duplicates (shouldn't occur in bags but be safe)
+                        local grouped = false
+                        for _, entry in ipairs(scanResults) do
+                            if entry.name == cleanName then
+                                table.insert(entry.slots, string.format("bag%d-slot%d", bag, slot))
+                                grouped = true
+                                break
+                            end
+                        end
+                        if not grouped then
+                            local lvl = 0
+                            local itemTLO = mq.TLO.FindItem(string.format("=%s", cleanName))
+                            if itemTLO and itemTLO() then
+                                local ok, result = pcall(function()
+                                    local spellID = itemTLO.Scroll.SpellID()
+                                    if spellID and spellID > 0 then
+                                        local spell = mq.TLO.Spell(spellID)
+                                        if spell and spell() then
+                                            return spell.MinCasterLevel() or 0
+                                        end
+                                    end
+                                    return 0
+                                end)
+                                if ok and result and result > 0 then lvl = result end
+                            end
+                            table.insert(scanResults, {
+                                name  = cleanName,
+                                slots = { string.format("bag%d-slot%d", bag, slot) },
+                                level = lvl
+                            })
+                            selectedForWithdrawal[cleanName] = false
+                            found = found + 1
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    notify("GBank Scan", "Scan complete. " .. hilite(#scanResults) .. " unique matching item(s) found.", "success")
+
+    if #scanResults > 0 then
+        showPickerWindow = true
+    else
+        notify("GBank Scan", "No matching spell/skill/song/tome items found in inventory.", "warn")
+        showPickerWindow = false
+    end
+end
+
+-- Inventory scan: Anguish Mats — walks bags, matches against itemTargetList
+local function scanInventoryAnguish()
+    scanResults           = {}
+    selectedForWithdrawal = {}
+    pickerWindowTitle     = "Anguish Mats - Select Items to Deposit"
+    pickerActionLabel     = "Deposit Selected"
+    pickerMode            = "deposit"
+
+    notify("GBank Scan", "Scanning inventory bags for Anguish Mats...", "scan")
+
+    for bag = 23, 32 do
+        local container = mq.TLO.InvSlot(bag).Item
+        if container and container() then
+            local bagSize = container.Container() or 0
+            for slot = 1, bagSize do
+                local item = container.Item(slot)
+                if item and item() then
+                    local itemName = item.Name()
+                    if itemName and isAnguishMatItem(itemName) then
+                        local cleanName = itemName:gsub("^%s*(.-)%s*$", "%1")
+                        local grouped = false
+                        for _, entry in ipairs(scanResults) do
+                            if entry.name == cleanName then
+                                table.insert(entry.slots, string.format("bag%d-slot%d", bag, slot))
+                                grouped = true
+                                break
+                            end
+                        end
+                        if not grouped then
+                            table.insert(scanResults, {
+                                name  = cleanName,
+                                slots = { string.format("bag%d-slot%d", bag, slot) },
+                                level = 0
+                            })
+                            selectedForWithdrawal[cleanName] = false
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    notify("GBank Scan", "Scan complete. " .. hilite(#scanResults) .. " unique matching item(s) found.", "success")
+
+    if #scanResults > 0 then
+        showPickerWindow = true
+    else
+        notify("GBank Scan", "No matching Anguish Mat items found in inventory.", "warn")
+        showPickerWindow = false
+    end
+end
+
+-- Dispatch inventory scan to the correct function for the active category
+local function scanInventoryForCategory()
+    if selectedCategory == 1 then
+        scanInventoryAnguish()
+    else
+        scanInventorySpells()
+    end
+end
+
+
+
+-- Withdraws items listed in withdrawQueue one name per main-loop tick.
+-- Re-scans slot indices live after each action so shifts never cause misses.
+local function handlePickedWithdrawal()
+    if not mq.TLO.Window('GuildBankWnd').Open() then
+        notify("GBank Withdraw", "Bank window closed. Aborting selected withdrawal.", "error")
+        isWithdrawingPicked = false
+        withdrawQueue       = {}
+        return
+    end
+    if os.clock() * 1000 < lastActionTime + ACTION_DELAY then return end
+    if not clearCursorFailsafe() then
+        isWithdrawingPicked = false
+        withdrawQueue       = {}
+        return
+    end
+
+    while #withdrawQueue > 0 do
+        local targetName = withdrawQueue[1]
+
+        -- Re-scan live slot list (indices shift after each withdrawal)
+        local itemsCount = mq.TLO.Window('GuildBankWnd').Child('GBANK_ItemList').Items() or 0
+        local foundSlot  = nil
+        for i = 1, itemsCount do
+            local txt = mq.TLO.Window('GuildBankWnd').Child('GBANK_ItemList').List(i, 2)()
+            if txt then
+                local clean = txt:gsub("^%s*(.-)%s*$", "%1")
+                if clean == targetName then foundSlot = i break end
+            end
+        end
+
+        if foundSlot then
+            notify("GBank Withdraw", "Withdrawing " .. hilite(targetName) .. " from slot " .. hilite(foundSlot) .. "...", "action")
+            mq.cmd(string.format("/notify GuildBankWnd GBANK_ItemList listselect %d", foundSlot))
+            mq.delay(200)
+            mq.cmd("/notify GuildBankWnd GBANK_WithdrawButton leftmouseup")
+            mq.delay(300)
+
+            handleQuantityWindow()
+
+            lastActionTime = os.clock() * 1000
+            mq.delay(400)
+
+            if mq.TLO.Cursor() then
+                mq.cmd("/autoinventory")
+                mq.delay(300)
+            end
+
+            -- Advance queue only when this name is fully gone from the bank
+            local stillPresent = false
+            local countAfter = mq.TLO.Window('GuildBankWnd').Child('GBANK_ItemList').Items() or 0
+            for i = 1, countAfter do
+                local txt = mq.TLO.Window('GuildBankWnd').Child('GBANK_ItemList').List(i, 2)()
+                if txt then
+                    local clean = txt:gsub("^%s*(.-)%s*$", "%1")
+                    if clean == targetName then stillPresent = true break end
+                end
+            end
+            if not stillPresent then table.remove(withdrawQueue, 1) end
+            return -- yield to main loop for throttle / cursor safety
+        else
+            notify("GBank Withdraw", hilite(targetName) .. " not found in bank. Skipping.", "warn")
+            table.remove(withdrawQueue, 1)
+        end
+    end
+
+    -- Queue exhausted
+    notify("GBank Withdraw", "All selected items withdrawn successfully.", "success")
+    isWithdrawingPicked   = false
+    showPickerWindow      = false
+    scanResults           = {}
+    selectedForWithdrawal = {}
+end
+
+-- ─── Standard Full-Sweep GET (Spells GIVE fallback / non-picker paths) ────────
+
+local function handleGetMode()
+    if not isRunningWorkflow then return end
+    if not mq.TLO.Window('GuildBankWnd').Open() then return end
+    if os.clock() * 1000 < lastActionTime + ACTION_DELAY then return end
+    if not clearCursorFailsafe() then return end
+
+    local itemsCount = mq.TLO.Window('GuildBankWnd').Child('GBANK_ItemList').Items() or 0
+    if itemsCount == 0 then return end
+
+    for i = 1, itemsCount do
+        if not isRunningWorkflow then return end
+        local itemText = mq.TLO.Window('GuildBankWnd').Child('GBANK_ItemList').List(i, 2)()
+        if itemText and itemText ~= "" then
+            if isTargetItem(itemText) then
+                notify("GBank GET", "Match: " .. hilite(itemText) .. " in slot " .. hilite(i) .. ".", "success")
+                mq.delay(100)
+                mq.cmd(string.format("/notify GuildBankWnd GBANK_ItemList listselect %d", i))
+                mq.delay(200)
+                mq.cmd("/notify GuildBankWnd GBANK_WithdrawButton leftmouseup")
+                mq.delay(300)
+                handleQuantityWindow()
+                lastActionTime = os.clock() * 1000
+                mq.delay(400)
+                if mq.TLO.Cursor() then mq.cmd("/autoinventory") end
+                return
+            end
+        end
+    end
+
+    if isRunningWorkflow then
+        notify("GBank GET", "No more matching items on this page.", "warn")
+        isRunningWorkflow = false
+        workflowStep      = 0
+    end
+end
+
+-- ─── GIVE Mode ────────────────────────────────────────────────────────────────
+
+-- Method A: promote deposit staging items to vault and set all to Public
+local function processOfficerPublicVaultRoutines()
+    if not isRunningWorkflow then return end
+    if not mq.TLO.Window('GuildBankWnd').Open() then return end
+
+    notify("GBank Give", "GIVE complete. Checking deposit staging list...", "info")
+    mq.delay(500)
+
+    local depositCount = mq.TLO.Window('GuildBankWnd').Child('GBANK_DepositList').Items() or 0
+    while depositCount > 0 and isRunningWorkflow do
+        notify("GBank Give", "Promoting deposit slot 1... (" .. hilite(depositCount) .. " remaining)", "action")
+        mq.cmd("/notify GuildBankWnd GBANK_DepositList listselect 1")
+        mq.delay(250)
+        mq.cmd("/notify GuildBankWnd GBANK_PromoteButton leftmouseup")
+        mq.delay(600)
+        depositCount = mq.TLO.Window('GuildBankWnd').Child('GBANK_DepositList').Items() or 0
+    end
+
+    notify("GBank Promote", "Performing public-access sweep across all vault slots...", "officer")
+    mq.delay(500)
+
+    local mainItemsCount = mq.TLO.Window('GuildBankWnd').Child('GBANK_ItemList').Items() or 0
+    if mainItemsCount == 0 then return end
+
+    for i = 1, mainItemsCount do
+        if not isRunningWorkflow then return end
+        local itemText = mq.TLO.Window('GuildBankWnd').Child('GBANK_ItemList').List(i, 2)()
+        if itemText and itemText ~= "" then
+            local permText = mq.TLO.Window('GuildBankWnd').Child('GBANK_ItemList').List(i, 4)() or ""
+            if permText:lower() ~= "public" then
+                notify("GBank Promote", "Row " .. hilite(i) .. " (" .. hilite(itemText) .. ") permission=" .. hilite(permText) .. ". Forcing PUBLIC...", "officer")
+                mq.cmd(string.format("/notify GuildBankWnd GBANK_ItemList listselect %d", i))
+                mq.delay(250)
+                mq.cmd("/notify GuildBankWnd GBANK_PermissionCombo listselect 4")
+                mq.delay(500)
+            end
+        end
+    end
+
+    notify("GBank Promote", "Transfer and public-sweep finished successfully!", "success")
+end
+
+-- ─── Picked Deposit Engine ────────────────────────────────────────────────────
+
+-- Deposits items listed in depositQueue one name per main-loop tick.
+-- Uses FindItem to locate the item in bags, picks it up, then deposits it.
+local function handlePickedDeposit()
+    if not mq.TLO.Window('GuildBankWnd').Open() then
+        notify("GBank Deposit", "Bank window closed. Aborting selected deposit.", "error")
+        isDepositingPicked = false
+        depositQueue       = {}
+        return
+    end
+    if os.clock() * 1000 < lastActionTime + ACTION_DELAY then return end
+    if not clearCursorFailsafe() then
+        isDepositingPicked = false
+        depositQueue       = {}
+        return
+    end
+
+    if #depositQueue > 0 then
+        local targetName = depositQueue[1]
+        local item = mq.TLO.FindItem(string.format("=%s", targetName))
+
+        if item and item() then
+            notify("GBank Deposit", "Depositing " .. hilite(targetName) .. "...", "action")
+            mq.cmd(string.format("/shift /itemnotify \"%s\" leftmouseup", targetName))
+            mq.delay(400)
+
+            if mq.TLO.Cursor() then
+                mq.cmd("/notify GuildBankWnd GBANK_DepositButton leftmouseup")
+                lastActionTime = os.clock() * 1000
+                mq.delay(400)
+            end
+
+            -- Check if item still exists in inventory; if not, advance queue
+            local still = mq.TLO.FindItem(string.format("=%s", targetName))
+            if not (still and still()) then
+                table.remove(depositQueue, 1)
+            end
+        else
+            notify("GBank Deposit", hilite(targetName) .. " not found in inventory. Skipping.", "warn")
+            table.remove(depositQueue, 1)
+        end
+        return -- yield to main loop
+    end
+
+    -- Queue exhausted — run public-vault sweep then clean up
+    if cachedIsOfficer then
+        notify("GBank Deposit", "All selected items deposited. Running public-access sweep...", "success")
+        isRunningWorkflow = true
+        processOfficerPublicVaultRoutines()
+        isRunningWorkflow = false
+    else
+        notify("GBank Deposit", "All selected items deposited. Skipping public-access sweep (not an officer).", "warn")
+    end
+    isDepositingPicked = false
+    showPickerWindow   = false
+    scanResults           = {}
+    selectedForWithdrawal = {}
+    notify("GBank Deposit", "Deposit complete.", "success")
+end
+
+
+local function handleGiveMode()
+    if not isRunningWorkflow then return end
+    if not mq.TLO.Window('GuildBankWnd').Open() then return end
+    if os.clock() * 1000 < lastActionTime + ACTION_DELAY then return end
+    if not clearCursorFailsafe() then return end
+
+    for _, name in ipairs(activeList()) do
+        if not isRunningWorkflow then return end
+        local item = mq.TLO.FindItem(string.format("=%s", name))
+        if item and item() then
+            notify("GBank Give", "Match: " .. hilite(name) .. " in inventory.", "success")
+            mq.delay(100)
+            mq.cmd(string.format("/shift /itemnotify \"%s\" leftmouseup", name))
+            mq.delay(400)
+            if mq.TLO.Cursor() then
+                mq.cmd("/notify GuildBankWnd GBANK_DepositButton leftmouseup")
+                lastActionTime = os.clock() * 1000
+                mq.delay(400)
+                return
+            end
+        end
+    end
+
+    if isRunningWorkflow then
+        if cachedIsOfficer then
+            processOfficerPublicVaultRoutines()
+        else
+            notify("GBank Give", "Skipping public-access sweep (not an officer).", "warn")
+        end
+        isRunningWorkflow = false
+        workflowStep      = 0
+    end
+end
+
+-- ─── Navigation Workflow ──────────────────────────────────────────────────────
+
+-- True when the current mode uses the picker-scan path (both categories in GET mode)
+local function isPickerGetMode()
+    return selectedOption == 1 -- GET mode always uses picker for both categories
+end
+
+local function processBankWorkflow()
+    if workflowStep == 1 then
+        mq.cmd("/target npc \"guild treasurer\"")
+        mq.delay(300)
+        local targetName = mq.TLO.Target.CleanName()
+        if targetName and string.find(targetName:lower(), "guild treasurer") then
+            notify("GBank Workflow", "Target found: " .. targetName .. ". Navigating...", "info")
+            mq.cmd("/nav target")
+            workflowStep = 2
+        else
+            notify("GBank Workflow", "Error: Could not locate a Guild Treasurer nearby.", "error")
+            isRunningWorkflow = false
+            workflowStep      = 0
+        end
+        return
+    end
+
+    if workflowStep == 2 then
+        if not mq.TLO.Navigation.Active() then
+            local dist = mq.TLO.Target.Distance()
+            if dist and dist < 20 then
+                notify("GBank Workflow", "Arrived. Interacting...", "info")
+                mq.cmd("/click left target")
+                mq.delay(1000)
+                workflowStep = 3
+            else
+                notify("GBank Workflow", "Navigation failed or stopped short. Aborting.", "error")
+                isRunningWorkflow = false
+                workflowStep      = 0
+            end
+        end
+        return
+    end
+
+    if workflowStep == 3 then
+        if mq.TLO.Window('GuildBankWnd').Open() then
+            notify("GBank Workflow", "Bank open. Starting...", "success")
+            workflowStep = 4
+        else
+            mq.cmd("/click right target")
+            mq.delay(1000)
+        end
+        return
+    end
+
+    if workflowStep == 4 then
+        if not mq.TLO.Window('GuildBankWnd').Open() then
+            notify("GBank Workflow", "Bank window closed. Aborting.", "error")
+            isRunningWorkflow = false
+            pendingPrune      = false
+            pendingPromote    = false
+            workflowStep      = 0
+            return
+        end
+
+        if pendingPrune then
+            pendingPrune      = false
+            isRunningWorkflow = false
+            workflowStep      = 0
+            isPruning         = true
+            notify("GBank Prune", "Bank open. Starting spell prune (withdrawing spells below level " .. hilite(PRUNE_LEVEL_CUTOFF) .. ")...", "info")
+        elseif pendingPromote then
+            pendingPromote    = false
+            isRunningWorkflow = false
+            workflowStep      = 0
+            isPromoting       = true
+            notify("GBank Promote", "Bank open. Starting public-access sweep...", "officer")
+        elseif selectedOption == 1 then
+            -- Both categories in GET mode: bank scan → picker
+            scanBankForCategory()
+            isRunningWorkflow = false
+            workflowStep      = 0
+        else
+            -- Both categories in GIVE mode: inventory scan → picker (bank now confirmed open)
+            scanInventoryForCategory()
+            isRunningWorkflow = false
+            workflowStep      = 0
+        end
+    end
+end
+
+-- ─── Picker Window ────────────────────────────────────────────────────────────
+
+local function pickerGUI()
+    if not showPickerWindow then return end
+
+    local pickerFlags = ImGuiWindowFlags.AlwaysAutoResize
+    local pVisible, pOpen = ImGui.Begin(pickerWindowTitle, true, pickerFlags)
+    if pVisible then
+        if #scanResults == 0 then
+            ImGui.TextColored(1.0, 0.6, 0.2, 1.0, "No matching items found in the bank.")
+        else
+            ImGui.Text(string.format("%d matching item(s) found. Select items to %s:",
+                #scanResults, pickerMode == "deposit" and "deposit" or "withdraw"))
+            ImGui.Separator()
+
+            if ImGui.Button("Select All") then
+                for _, entry in ipairs(scanResults) do
+                    selectedForWithdrawal[entry.name] = true
+                end
+            end
+            ImGui.SameLine()
+            if ImGui.Button("Deselect All") then
+                for _, entry in ipairs(scanResults) do
+                    selectedForWithdrawal[entry.name] = false
+                end
+            end
+
+            ImGui.Separator()
+
+            local showLevel  = (selectedCategory == 2) -- only spells have meaningful levels
+            local listWidth  = showLevel and 460 or 360
+            local listHeight = math.min(#scanResults * 24 + 8, 300)
+
+            if showLevel then
+                ImGui.Columns(2, "PickerHdrCols", false)
+                ImGui.SetColumnWidth(0, 360)
+                ImGui.SetColumnWidth(1, 90)
+                ImGui.TextColored(0.7, 0.7, 0.7, 1.0, "Item")
+                ImGui.NextColumn()
+                ImGui.TextColored(0.7, 0.7, 0.7, 1.0, "Req. Level")
+                ImGui.NextColumn()
+                ImGui.Columns(1)
+                ImGui.Separator()
+            end
+
+            ImGui.BeginChild("PickerList", listWidth, listHeight, false)
+
+            if showLevel then
+                ImGui.Columns(2, "PickerCols", false)
+                ImGui.SetColumnWidth(0, 360)
+                ImGui.SetColumnWidth(1, 90)
+            end
+
+            for _, entry in ipairs(scanResults) do
+                local checked    = selectedForWithdrawal[entry.name] or false
+                local stackInfo  = #entry.slots > 1 and string.format("  (%d stacks)", #entry.slots) or ""
+                local label      = entry.name .. stackInfo
+                local newChecked = ImGui.Checkbox(label, checked)
+                if newChecked ~= checked then
+                    selectedForWithdrawal[entry.name] = newChecked
+                end
+                if showLevel then
+                    ImGui.NextColumn()
+                    local lvlStr = (entry.level and entry.level > 0) and tostring(entry.level) or "-"
+                    ImGui.Text(lvlStr)
+                    ImGui.NextColumn()
+                end
+            end
+
+            if showLevel then
+                ImGui.Columns(1)
+            end
+
+            ImGui.EndChild()
+
+            ImGui.Separator()
+
+            local tickedCount = 0
+            for _, v in pairs(selectedForWithdrawal) do
+                if v then tickedCount = tickedCount + 1 end
+            end
+
+            if isWithdrawingPicked then
+                ImGui.TextColored(0.0, 1.0, 0.0, 1.0, string.format("Withdrawing... (%d remaining)", #withdrawQueue))
+                if ImGui.Button("CANCEL WITHDRAWAL", ImVec2(200, 25)) then
+                    isWithdrawingPicked = false
+                    withdrawQueue       = {}
+                    notify("GBank Withdraw", "Withdrawal cancelled by user.", "warn")
+                end
+            elseif isDepositingPicked then
+                ImGui.TextColored(0.0, 1.0, 0.0, 1.0, string.format("Depositing... (%d remaining)", #depositQueue))
+                if ImGui.Button("CANCEL DEPOSIT", ImVec2(200, 25)) then
+                    isDepositingPicked = false
+                    depositQueue       = {}
+                    notify("GBank Deposit", "Deposit cancelled by user.", "warn")
+                end
+            else
+                if tickedCount == 0 then ImGui.BeginDisabled() end
+                if ImGui.Button(string.format("%s (%d)", pickerActionLabel, tickedCount), ImVec2(210, 25)) then
+                    if pickerMode == "deposit" then
+                        depositQueue = {}
+                        for _, entry in ipairs(scanResults) do
+                            if selectedForWithdrawal[entry.name] then
+                                table.insert(depositQueue, entry.name)
+                            end
+                        end
+                        isDepositingPicked    = true
+                        showPickerWindow      = false
+                        scanResults           = {}
+                        selectedForWithdrawal = {}
+                        notify("GBank Deposit", "Queuing " .. hilite(#depositQueue) .. " item type(s) for deposit.", "info")
+                    else
+                        withdrawQueue = {}
+                        for _, entry in ipairs(scanResults) do
+                            if selectedForWithdrawal[entry.name] then
+                                table.insert(withdrawQueue, entry.name)
+                            end
+                        end
+                        isWithdrawingPicked   = true
+                        showPickerWindow      = false
+                        scanResults           = {}
+                        selectedForWithdrawal = {}
+                        notify("GBank Withdraw", "Queuing " .. hilite(#withdrawQueue) .. " item type(s) for withdrawal.", "info")
+                    end
+                end
+                if tickedCount == 0 then ImGui.EndDisabled() end
+
+                ImGui.SameLine()
+                if ImGui.Button("Close", ImVec2(60, 25)) then
+                    showPickerWindow      = false
+                    scanResults           = {}
+                    selectedForWithdrawal = {}
+                end
+            end
+        end
+    end
+    ImGui.End()
+    if not pOpen then
+        showPickerWindow    = false
+        isWithdrawingPicked = false
+        isDepositingPicked  = false
+        withdrawQueue       = {}
+        depositQueue        = {}
+    end
+end
+
+-- ─── Guild Rank Lookup ────────────────────────────────────────────────────────
+
+-- Opens the guild management window, finds our row, caches the rank, then closes it.
+-- Must be called from the main loop thread (delays are safe there).
+local function fetchGuildRank()
+    local myName  = mq.TLO.Me.Name() or ""
+    local wasOpen = mq.TLO.Window('GuildManagementWnd').Open()
+
+    if not wasOpen then
+        mq.TLO.Window('GuildManagementWnd').DoOpen()
+        -- Wait up to 5 seconds for window to open and member list to populate
+        local timeout = os.clock() + 5.0
+        while os.clock() < timeout do
+            mq.delay(100)
+            local cnt = mq.TLO.Window('GuildManagementWnd').Child('GT_MemberList').Items()
+            if mq.TLO.Window('GuildManagementWnd').Open() and cnt and cnt > 0 then break end
+        end
+    end
+
+    if not mq.TLO.Window('GuildManagementWnd').Open() then
+        notify("GBank", "GuildManagementWnd could not be opened. Cannot determine guild rank.", "error")
+        return
+    end
+
+    local memberCount = mq.TLO.Window('GuildManagementWnd').Child('GT_MemberList').Items() or 0
+
+    -- Find our row by scanning all columns for our name
+    local myRow = nil
+    for gi = 1, memberCount do
+        for col = 1, 6 do
+            local v = mq.TLO.Window('GuildManagementWnd').Child('GT_MemberList').List(gi, col)() or ""
+            if v:lower() == myName:lower() then
+                myRow = gi
+                break
+            end
+        end
+        if myRow then break end
+    end
+
+    if myRow then
+        mq.cmd(string.format("/notify GuildManagementWnd GT_MemberList listselect %d", myRow))
+        mq.delay(500)
+
+        local rank = mq.TLO.Window('GuildManagementWnd').Child('GT_MemberList').List(myRow, 4)() or "Unknown"
+        cachedGuildRank = rank
+        local rl = rank:lower()
+        cachedIsOfficer = (rl == "officer" or rl == "leader")
+        notify("GBank", "Guild rank detected: " .. hilite(rank) .. " (Officer: " .. hilite(tostring(cachedIsOfficer)) .. ")", "officer")
+    else
+        notify("GBank", "Could not find " .. hilite(myName) .. " in " .. hilite(memberCount) .. " guild members.", "error")
+    end
+
+    if not wasOpen then
+        mq.TLO.Window('GuildManagementWnd').DoClose()
+    end
+end
+
+-- ─── Main GUI ─────────────────────────────────────────────────────────────────
+
+local function mainGUI()
+    if not openGUI then shouldDraw = false return end
+
+    local flags = ImGuiWindowFlags.AlwaysAutoResize
+    local visible, open = ImGui.Begin("Guild Bank Automator v" .. version, openGUI, flags)
+    if visible then
+        -- Guild rank / officer status (cached at startup)
+        if cachedIsOfficer then
+            ImGui.TextColored(0.2, 1.0, 0.4, 1.0, string.format("Guild Rank: %s  [Officer Access]", cachedGuildRank))
+        else
+            ImGui.TextColored(1.0, 0.6, 0.2, 1.0, string.format("Guild Rank: %s  [No Officer Access]", cachedGuildRank))
+        end
+
+        -- Officer-only action buttons
+        if cachedIsOfficer and not (isRunningWorkflow or isWithdrawingPicked or isDepositingPicked or isPruning or isPromoting) then
+            local pruneW   = 130
+            local promoteW = 90
+            local spacing  = ImGui.GetStyle().ItemSpacing.x
+            local pairW    = pruneW + spacing + promoteW
+            local availW   = ImGui.GetContentRegionAvail()
+            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + (availW - pairW) * 0.5)
+            if ImGui.Button("PRUNE SPELLS", ImVec2(pruneW, 25)) then
+                if mq.TLO.Window('GuildBankWnd').Open() then
+                    isPruning = true
+                    notify("GBank Prune", "Starting spell prune (withdrawing spells below level " .. hilite(PRUNE_LEVEL_CUTOFF) .. ")...", "info")
+                else
+                    isPruning         = false
+                    isRunningWorkflow = true
+                    workflowStep      = 1
+                    pendingPrune      = true
+                end
+            end
+            ImGui.SameLine()
+            if ImGui.Button("PROMOTE", ImVec2(promoteW, 25)) then
+                if mq.TLO.Window('GuildBankWnd').Open() then
+                    isPromoting = true
+                    notify("GBank Promote", "Starting public-access sweep...", "officer")
+                else
+                    isRunningWorkflow = true
+                    workflowStep      = 1
+                    pendingPromote    = true
+                end
+            end
+            -- Prune action selection
+            ImGui.Text("Prune action:")
+            ImGui.SameLine()
+            if ImGui.RadioButton("Keep (autoinv)", pruneAction == 1) then pruneAction = 1 end
+            ImGui.SameLine()
+            if ImGui.RadioButton("Destroy", pruneAction == 2) then pruneAction = 2 end
+        end
+
+        ImGui.Separator()
+
+        -- Category (locked while busy)
+        ImGui.Text("Select Category:")
+        if isRunningWorkflow or isWithdrawingPicked or isDepositingPicked or isPruning then ImGui.BeginDisabled() end
+        if ImGui.RadioButton("Anguish Mats", selectedCategory == 1) then selectedCategory = 1 end
+        if ImGui.RadioButton("Spells/Songs/Skills/Tomes", selectedCategory == 2) then selectedCategory = 2 end
+        if isRunningWorkflow or isWithdrawingPicked or isDepositingPicked or isPruning then ImGui.EndDisabled() end
+
+        ImGui.Separator()
+
+        ImGui.Text("Select Mode:")
+        if ImGui.RadioButton("GET (Withdraw)", selectedOption == 1) then selectedOption = 1 end
+        if ImGui.RadioButton("GIVE (Deposit)", selectedOption == 2) then selectedOption = 2 end
+
+        ImGui.Separator()
+
+        local isBusy = isRunningWorkflow or isWithdrawingPicked or isDepositingPicked or isPruning or isPromoting
+
+        if isBusy then
+            local label = isWithdrawingPicked and "CANCEL WITHDRAWAL"
+                       or isDepositingPicked  and "CANCEL DEPOSIT"
+                       or isPruning           and "CANCEL PRUNE"
+                       or isPromoting         and "CANCEL PROMOTE"
+                       or                        "CANCEL ACTION"
+            local cancelW = 180
+            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + (ImGui.GetContentRegionAvail() - cancelW) * 0.5)
+            if ImGui.Button(label, ImVec2(cancelW, 25)) then
+                mq.cmd("/nav stop")
+                isRunningWorkflow  = false
+                isWithdrawingPicked = false
+                isDepositingPicked  = false
+                isPruning          = false
+                isPromoting        = false
+                pendingPrune       = false
+                pendingPromote     = false
+                withdrawQueue      = {}
+                depositQueue       = {}
+                workflowStep       = 0
+                notify("GBank", "Automation cancelled by user.", "warn")
+            end
+        else
+            -- Button label depends on category + mode combination:
+            --   GET (either category)        -> SCAN BANK
+            --   GIVE (either category)       -> SCAN INVENTORY
+            local btnLabel  = selectedOption == 1 and "SCAN GUILD BANK" or "SCAN INVENTORY"
+            local btnWidth  = 180
+            local availW    = ImGui.GetContentRegionAvail()
+            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + (availW - btnWidth) * 0.5)
+            if ImGui.Button(btnLabel, ImVec2(btnWidth, 25)) then
+                if selectedOption == 1 then
+                    -- GET: both categories use bank picker
+                    if mq.TLO.Window('GuildBankWnd').Open() then
+                        scanBankForCategory()
+                    else
+                        isRunningWorkflow = true
+                        workflowStep      = 1
+                    end
+                else
+                    -- GIVE: both categories use inventory picker
+                    -- Bank must be open to deposit afterwards
+                    if mq.TLO.Window('GuildBankWnd').Open() then
+                        scanInventoryForCategory()
+                    else
+                        -- Navigate to treasurer first, inventory scan happens at step 4
+                        isRunningWorkflow = true
+                        workflowStep      = 1
+                    end
+                end
+            end
+        end
+
+        ImGui.Separator()
+
+        if mq.TLO.Window('GuildBankWnd').Open() then
+            if isWithdrawingPicked then
+                ImGui.TextColored(0.0, 1.0, 0.0, 1.0, "Status: Withdrawing Selected Items...")
+            elseif isDepositingPicked then
+                ImGui.TextColored(0.0, 1.0, 0.0, 1.0, "Status: Depositing Selected Items...")
+            elseif isPruning then
+                ImGui.TextColored(1.0, 0.6, 0.0, 1.0, string.format("Status: Pruning spells below level %d...", PRUNE_LEVEL_CUTOFF))
+            elseif isPromoting then
+                ImGui.TextColored(0.6, 0.8, 1.0, 1.0, "Status: Running public-access sweep...")
+            elseif isRunningWorkflow then
+                ImGui.TextColored(0.0, 1.0, 0.0, 1.0, "Status: Transferring Items...")
+            else
+                ImGui.TextColored(0.0, 1.0, 1.0, 1.0, "Status: Bank Open (Paused/Idle)")
+            end
+        elseif isRunningWorkflow then
+            ImGui.TextColored(1.0, 1.0, 0.0, 1.0, string.format("Status: Moving/Interacting (Step %d)", workflowStep))
+        else
+            ImGui.TextColored(1.0, 0.4, 0.4, 1.0, "Status: Idle")
+        end
+
+        ImGui.Separator()
+        local exitBtnWidth = 180
+        local windowWidth  = ImGui.GetContentRegionAvail()
+        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + (windowWidth - exitBtnWidth) * 0.5)
+        ImGui.PushStyleColor(ImGuiCol.Button,        0.6, 0.1, 0.1, 1.0)
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, 0.8, 0.2, 0.2, 1.0)
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive,  0.4, 0.05, 0.05, 1.0)
+        if ImGui.Button("EXIT SCRIPT", ImVec2(exitBtnWidth, 25)) then
+            mq.cmd("/nav stop")
+            isRunningWorkflow  = false
+            isWithdrawingPicked = false
+            isDepositingPicked  = false
+            isPruning          = false
+            isPromoting        = false
+            pendingPrune       = false
+            pendingPromote     = false
+            shouldDraw         = false
+            notify("GBank", "Script safely terminated.", "success")
+        end
+        ImGui.PopStyleColor(3)
+    end
+    ImGui.End()
+    if not open then shouldDraw = false end
+
+    pickerGUI()
+end
+
+mq.imgui.init('GuildBankHelperUI', mainGUI)
+
+-- Fetch guild rank once on startup from the main thread (delays are safe here)
+fetchGuildRank()
+
+-- ─── Primary Execution Engine ─────────────────────────────────────────────────
+
+while shouldDraw do
+    if isWithdrawingPicked then
+        handlePickedWithdrawal()
+    elseif isDepositingPicked then
+        handlePickedDeposit()
+    elseif isPruning then
+        if cachedIsOfficer then
+            if mq.TLO.Window('GuildBankWnd').Open() then
+                handlePruneSpells()
+            else
+                notify("GBank Prune", "Guild Bank is not open. Aborting prune.", "error")
+                isPruning = false
+            end
+        else
+            notify("GBank Prune", "Aborted — not an officer.", "error")
+            isPruning = false
+        end
+    elseif isPromoting then
+        if cachedIsOfficer then
+            if mq.TLO.Window('GuildBankWnd').Open() then
+                isRunningWorkflow = true
+                processOfficerPublicVaultRoutines()
+                isRunningWorkflow = false
+                notify("GBank Promote", "Public-access sweep complete.", "success")
+            else
+                notify("GBank Promote", "Guild Bank closed before sweep could run.", "error")
+            end
+        else
+            notify("GBank Promote", "Aborted — not an officer.", "error")
+        end
+        isPromoting = false
+    elseif isRunningWorkflow then
+        processBankWorkflow()
+    end
+    mq.delay(50)
+end
+
+mq.imgui.destroy('GuildBankHelperUI')

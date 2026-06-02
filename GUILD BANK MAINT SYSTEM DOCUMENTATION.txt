@@ -1,0 +1,226 @@
+-- =============================================================================
+-- GuildBankMaint
+-- Guild Bank Automation Script for MacroQuest (MQ Lua)
+-- Save as `gbank_helper.lua` in your MacroQuest `lua` folder.
+-- Run in-game with: /lua run gbank_helper
+-- =============================================================================
+--
+-- OVERVIEW
+-- --------
+-- Automates guild bank interactions for Anguish Mat farming and
+-- Spell/Song/Skill/Tome management. Provides an ImGui UI with category and
+-- mode selection, picker windows for selective withdraw/deposit, officer-only
+-- tools, and a unified colored notification system.
+--
+-- REQUIREMENTS
+-- ------------
+-- - MacroQuest with Lua and ImGui support
+-- - MQ Navigation plugin (for auto-pathing to Guild Treasurer)
+-- - Guild membership (officer rank required for PROMOTE and PRUNE SPELLS)
+-- - GuildManagementWnd must be openable in-game
+--
+-- USAGE
+-- -----
+-- 1. Run: /lua run gbank_helper
+-- 2. Open the Guild Management window before starting (for rank detection).
+-- 3. Select a Category (Anguish Mats or Spells/Songs/Skills/Tomes).
+-- 4. Select a Mode (GET to withdraw, GIVE to deposit).
+-- 5. Click SCAN GUILD BANK (GET) or SCAN INVENTORY (GIVE).
+-- 6. If the bank is not open, the script will navigate to the Guild Treasurer.
+-- 7. A picker window will appear — select items and confirm.
+--
+-- ITEM LISTS
+-- ----------
+-- itemTargetList  : Anguish Mat items matched by exact name for GET/GIVE.
+-- spellTargetList : Optional explicit spell/tome names (patterns auto-match).
+--                   EQ naming conventions auto-detected:
+--                     "Spell: *", "Song: *", "Tome of *", "Tome: *",
+--                     "Skill: *", items containing "Rk. I/II/III"
+--
+-- =============================================================================
+-- FUNCTION REFERENCE
+-- =============================================================================
+--
+-- NOTIFICATION
+-- ------------
+-- notify(tag, msg, kind)
+--   Sends a colored /echo message. tag = label shown in brackets.
+--   kind: "info"(yellow), "success"(green), "error"(red), "warn"(orange),
+--         "scan"(teal), "action"(white), "officer"(magenta)
+--
+-- MATCH HELPERS
+-- -------------
+-- activeList()
+--   Returns itemTargetList or spellTargetList based on selectedCategory.
+--
+-- isAnguishMatItem(itemName)
+--   Returns true if itemName exactly matches an entry in itemTargetList.
+--   Case-insensitive, strips leading/trailing whitespace.
+--
+-- isSpellItem(itemName)
+--   Returns true if itemName matches EQ spell/song/skill/tome naming patterns
+--   ("Spell: ", "Song: ", "Tome of ", "Tome: ", "Skill: ", "Rk. I/II/III"),
+--   or matches an explicit entry in spellTargetList.
+--
+-- isTargetItem(itemName)
+--   Routes to isAnguishMatItem or isSpellItem based on selectedCategory.
+--
+-- SHARED UTILITIES
+-- ----------------
+-- clearCursorFailsafe()
+--   Checks if an item is stuck on the cursor and calls /autoinventory.
+--   Aborts the active workflow if inventory is full. Returns true if safe.
+--
+-- handleQuantityWindow()
+--   Detects the QuantityWnd popup (stacked items), sets slider to max,
+--   and confirms. Waits up to 2 seconds for the item to reach the cursor.
+--
+-- PRUNE SPELLS ENGINE
+-- -------------------
+-- handlePruneSpells()
+--   Called each main-loop tick while isPruning is true. Walks GBANK_ItemList,
+--   identifies spell/song/skill/tome items via isSpellItem(), looks up their
+--   MinCasterLevel via mq.TLO.Spell(spellName).MinCasterLevel(), and withdraws
+--   any item below PRUNE_LEVEL_CUTOFF (default 65). Depending on pruneAction:
+--     1 = /autoinventory (keep), 2 = /destroy (discard).
+--   Yields back to the main loop after each withdrawal so slot indices
+--   are re-scanned fresh on the next tick.
+--
+-- BANK SCAN CORE
+-- --------------
+-- doScan(matchFn, windowTitle, actionLabel, mode, logTag)
+--   Internal shared scan engine. Walks GBANK_ItemList, calls matchFn() on
+--   each item name, groups stacks of the same item, and populates scanResults
+--   and selectedForWithdrawal (all unchecked by default). Sets pickerWindowTitle,
+--   pickerActionLabel, and pickerMode ("withdraw"/"deposit"). Opens the picker
+--   window if any matches are found. Does NOT move or touch any items.
+--
+-- scanBankAnguish()
+--   Calls doScan with isAnguishMatItem for the Anguish Mats GET picker.
+--
+-- scanBankSpells()
+--   Calls doScan with isSpellItem for the Spells GET picker. Looks up
+--   MinCasterLevel via Spell TLO for each match to display required level.
+--
+-- scanBankForCategory()
+--   Dispatches to scanBankAnguish or scanBankSpells based on selectedCategory.
+--
+-- scanInventorySpells()
+--   Walks bag slots 23-32 (all main packs), runs isSpellItem on each sub-slot.
+--   Looks up MinCasterLevel via FindItem + Scroll.SpellID → Spell TLO chain.
+--   Populates scanResults for the deposit picker (pickerMode = "deposit").
+--
+-- scanInventoryAnguish()
+--   Walks bag slots 23-32, runs isAnguishMatItem on each sub-slot.
+--   Populates scanResults for the deposit picker (pickerMode = "deposit").
+--
+-- scanInventoryForCategory()
+--   Dispatches to scanInventoryAnguish or scanInventorySpells.
+--
+-- PICKED WITHDRAWAL ENGINE
+-- ------------------------
+-- handlePickedWithdrawal()
+--   Called each main-loop tick while isWithdrawingPicked is true. Processes
+--   withdrawQueue one name per tick. Re-scans bank slot indices live after each
+--   withdrawal (indices shift after each removal). Calls handleQuantityWindow()
+--   for stacked items and /autoinventory after each pickup. Advances the queue
+--   only once the item is fully gone from the bank list.
+--
+-- PICKED DEPOSIT ENGINE
+-- ---------------------
+-- handlePickedDeposit()
+--   Called each main-loop tick while isDepositingPicked is true. Processes
+--   depositQueue one name per tick. Uses FindItem("=name") to locate each item
+--   in inventory, picks it up with /shift /itemnotify, then clicks
+--   GBANK_DepositButton. On queue exhaustion, calls processOfficerPublicVaultRoutines
+--   if cachedIsOfficer, then cleans up state.
+--
+-- STANDARD GET (non-picker fallback)
+-- -----------------------------------
+-- handleGetMode()
+--   Full-sweep bank withdrawal used for non-picker flows. Walks GBANK_ItemList,
+--   calls isTargetItem on each row, and withdraws the first match found per tick.
+--   Sets isRunningWorkflow = false when no more matches remain.
+--
+-- OFFICER PUBLIC VAULT ROUTINES
+-- ------------------------------
+-- processOfficerPublicVaultRoutines()
+--   Officer-only. First promotes all items in the GBANK_DepositList staging area
+--   to the main vault. Then walks every row in GBANK_ItemList, reads the
+--   permission from column 4, and changes any non-Public item to Public via
+--   GBANK_PermissionCombo listselect 4. Only called when cachedIsOfficer is true.
+--
+-- GIVE MODE (Anguish Mats sweep fallback)
+-- ----------------------------------------
+-- handleGiveMode()
+--   Legacy full-sweep deposit for Anguish Mats. Iterates activeList(), finds
+--   each item in inventory via FindItem, picks it up, and deposits it.
+--   Calls processOfficerPublicVaultRoutines on completion if officer.
+--   (Retained for compatibility; normal GIVE now uses the picker path.)
+--
+-- NAVIGATION WORKFLOW
+-- -------------------
+-- processBankWorkflow()
+--   Four-step sequenced automation:
+--     Step 1: /target npc "guild treasurer" — locates nearest treasurer.
+--     Step 2: /nav target — moves to the treasurer; waits for arrival.
+--     Step 3: /click left target — interacts to open the bank window.
+--     Step 4: Dispatches based on pending flags and selected mode:
+--               pendingPrune   → sets isPruning   = true
+--               pendingPromote → sets isPromoting  = true
+--               GET mode       → scanBankForCategory()
+--               GIVE mode      → scanInventoryForCategory()
+--
+-- PICKER WINDOW
+-- -------------
+-- pickerGUI()
+--   Renders a second floating ImGui window (independent of the main window).
+--   Displays scanResults as checkboxes, all unchecked by default.
+--   Shows a "Req. Level" column for Spells category scans.
+--   Provides Select All / Deselect All shortcuts and a scrollable list.
+--   Confirm button (label from pickerActionLabel) builds withdrawQueue or
+--   depositQueue from checked entries, sets the appropriate engine flag,
+--   and closes the window immediately.
+--
+-- GUILD RANK LOOKUP
+-- -----------------
+-- fetchGuildRank()
+--   Called once at script startup from the main loop thread (delays safe).
+--   Opens GuildManagementWnd via DoOpen() if not already open, waits up to
+--   5 seconds for GT_MemberList to populate, scans all columns of every row
+--   to find the character's own name, selects that row via listselect, waits
+--   500ms for the UI to update, then reads column 4 as the rank string.
+--   Caches result in cachedGuildRank and cachedIsOfficer (true for Officer/Leader).
+--   Closes the window again if it was opened by this function.
+--
+-- MAIN GUI
+-- --------
+-- mainGUI()
+--   ImGui render callback registered with mq.imgui.init. Renders the main
+--   "Guild Bank Automator" window on every frame. Layout (top to bottom):
+--     - Guild rank / officer status (color-coded green/orange)
+--     - PRUNE SPELLS + PROMOTE buttons (officer only, centered pair)
+--     - Prune action radio: Keep (autoinv) / Destroy
+--     - Separator
+--     - Category radio: Anguish Mats / Spells/Songs/Skills/Tomes
+--     - Separator
+--     - Mode radio: GET (Withdraw) / GIVE (Deposit)
+--     - Separator
+--     - SCAN GUILD BANK / SCAN INVENTORY / CANCEL button (centered)
+--     - Separator
+--     - Status line (color-coded by current operation)
+--     - Separator
+--     - EXIT SCRIPT button (centered, red)
+--   Also calls pickerGUI() each frame to render the picker popup if open.
+--
+-- PRIMARY EXECUTION ENGINE
+-- ------------------------
+--   Main while loop (runs while shouldDraw is true, 50ms tick).
+--   Priority order each tick:
+--     1. isWithdrawingPicked → handlePickedWithdrawal()
+--     2. isDepositingPicked  → handlePickedDeposit()
+--     3. isPruning           → handlePruneSpells()   (officer + bank open required)
+--     4. isPromoting         → processOfficerPublicVaultRoutines() (officer + bank open)
+--     5. isRunningWorkflow   → processBankWorkflow()
+--
+-- =============================================================================
