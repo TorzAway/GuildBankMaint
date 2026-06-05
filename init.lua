@@ -1,9 +1,9 @@
 -- =============================================================================
--- GuildBankMaint - Management Tool
+-- gbank_helper.lua
 -- Guild Bank Automation Script for MacroQuest (MQ Lua)
--- Save as `\GuildBankMaint\init.lua` in your MacroQuest `lua` folder.
+-- Save as `gbank_helper.lua` in your MacroQuest `lua` folder.
 -- Run in-game with: /lua run gbank_helper
--- ==============================================================================
+-- =============================================================================
 --
 -- OVERVIEW
 -- --------
@@ -28,6 +28,15 @@
 -- 5. Click SCAN GUILD BANK (GET) or SCAN INVENTORY (GIVE).
 -- 6. If the bank is not open, the script will navigate to the Guild Treasurer.
 -- 7. A picker window will appear — select items and confirm.
+--
+-- WINDOW COMMANDS
+-- ---------------
+-- /gbmhide  Collapse the main UI window to its title bar.
+-- /gbmshow  Restore the main UI window to full size.
+-- (Clicking the ImGui chevron also toggles collapse; both methods notify chat.)
+--
+-- EXIT SCRIPT button closes the guild bank window, inventory window, and any
+-- open bag windows before terminating the script.
 --
 -- ITEM LISTS
 -- ----------
@@ -210,8 +219,23 @@
 --     - Separator
 --     - Status line (color-coded by current operation)
 --     - Separator
---     - EXIT SCRIPT button (centered, red)
+--     - EXIT SCRIPT button (centered, red): stops all automation, closes
+--       GuildBankWnd, InventoryWindow, and any open Pack1-Pack10, then exits.
 --   Also calls pickerGUI() each frame to render the picker popup if open.
+--   Collapse state is tracked each frame; clicking the ImGui chevron directly
+--   also notifies chat with the appropriate /gbmshow or /gbmhide command hint.
+--
+-- WINDOW VISIBILITY BINDS
+-- -----------------------
+-- /gbmhide
+--   Collapses the main window to its title bar, identical to clicking the
+--   ImGui chevron. Notifies chat and echoes /gbmshow as the restore command.
+--   Has no effect (warns) if the window is already collapsed.
+--
+-- /gbmshow
+--   Restores a collapsed main window to its full size. Notifies chat and
+--   echoes /gbmhide as the hide command. Has no effect (warns) if already visible.
+--   Works whether the window was collapsed by /gbmhide or the chevron.
 --
 -- PRIMARY EXECUTION ENGINE
 -- ------------------------
@@ -248,14 +272,16 @@ end
 -- Wraps a variable value in red brackets with green text for notifications.
 -- Usage: notify("Tag", "Found " .. hilite(count) .. " items.", "info")
 local function hilite(val)
-    return "\\am[\\ag" .. tostring(val) .. "\\am]\\ay"
+    return "\am[\ag" .. tostring(val) .. "\am]\ay"
 end
 
 
 -- Global script states
-local version = "4.1"
+local version = "4.3"
 local openGUI = true
 local shouldDraw = true
+local windowCollapsed    = false  -- true while /gbmhide has collapsed the main window
+local pendingCollapseSet = false  -- true for one frame after /gbmshow or /gbmhide to force ImGui.Always
 local selectedOption = 1   -- 1 = GET, 2 = GIVE
 local selectedCategory = 1 -- 1 = Anguish Mats, 2 = Spells/Songs/Skills/Tomes
 
@@ -1265,8 +1291,29 @@ end
 local function mainGUI()
     if not openGUI then shouldDraw = false return end
 
+    -- Drive collapse state from /gbmhide or /gbmshow.
+    -- pendingCollapseSet is true for exactly one frame after a bind fires, so
+    -- we use ImGuiCond.Always to override ImGui's stored state.  After that one
+    -- frame we clear the flag and let ImGui (and the chevron) manage state freely.
+    local wasBindDriven = pendingCollapseSet
+    if pendingCollapseSet then
+        ImGui.SetNextWindowCollapsed(windowCollapsed, ImGuiCond.Always)
+        pendingCollapseSet = false
+    end
+
     local flags = ImGuiWindowFlags.AlwaysAutoResize
     local visible, open = ImGui.Begin("Guild Bank Automator v" .. version, openGUI, flags)
+
+    -- Sync collapse state and notify if the user toggled via the chevron.
+    local prevCollapsed = windowCollapsed
+    windowCollapsed = ImGui.IsWindowCollapsed()
+    if not wasBindDriven and windowCollapsed ~= prevCollapsed then
+        if windowCollapsed then
+            notify("GBank", "Main window minimized. Type " .. hilite("/gbmshow") .. " to restore it.", "info")
+        else
+            notify("GBank", "Main window restored. Type " .. hilite("/gbmhide") .. " to minimize it.", "success")
+        end
+    end
     if visible then
         -- Guild rank / officer status (cached at startup)
         if cachedIsOfficer then
@@ -1423,18 +1470,61 @@ local function mainGUI()
             isPromoting        = false
             pendingPrune       = false
             pendingPromote     = false
-            shouldDraw         = false
+            -- Close guild bank window if open
+            if mq.TLO.Window('GuildBankWnd').Open() then
+                mq.TLO.Window('GuildBankWnd').DoClose()
+                notify("GBank", "Guild bank window closed.", "action")
+            end
+            -- Close inventory window if open
+            if mq.TLO.Window('InventoryWindow').Open() then
+                mq.TLO.Window('InventoryWindow').DoClose()
+                notify("GBank", "Inventory window closed.", "action")
+            end
+            -- Close any open bag windows (Pack1-Pack10)
+            for i = 1, 10 do
+                local bagWnd = 'Pack' .. i
+                if mq.TLO.Window(bagWnd).Open() then
+                    mq.TLO.Window(bagWnd).DoClose()
+                end
+            end
+            shouldDraw = false
             notify("GBank", "Script safely terminated.", "success")
         end
         ImGui.PopStyleColor(3)
     end
     ImGui.End()
-    if not open then shouldDraw = false end
+    -- Only kill the script when the user clicks the X button (open=false and not
+    -- just collapsed — a collapsed window also returns visible=false but open stays true).
+    if not open and not windowCollapsed then shouldDraw = false end
 
     pickerGUI()
 end
 
 mq.imgui.init('GuildBankHelperUI', mainGUI)
+
+-- ─── Window Visibility Binds ──────────────────────────────────────────────────
+
+-- /gbmhide  — collapses the main window exactly as clicking the chevron would.
+mq.bind('/gbmhide', function()
+    if windowCollapsed then
+        notify("GBank", "Window is already minimized. Type " .. hilite("/gbmshow") .. " to restore it.", "warn")
+        return
+    end
+    windowCollapsed    = true
+    pendingCollapseSet = true
+    notify("GBank", "Main window minimized. Type " .. hilite("/gbmshow") .. " to restore it.", "info")
+end)
+
+-- /gbmshow  — restores the main window if it was collapsed by /gbmhide or the chevron.
+mq.bind('/gbmshow', function()
+    if not windowCollapsed then
+        notify("GBank", "Window is already visible. Type " .. hilite("/gbmhide") .. " to minimize it.", "warn")
+        return
+    end
+    windowCollapsed    = false
+    pendingCollapseSet = true
+    notify("GBank", "Main window restored. Type " .. hilite("/gbmhide") .. " to minimize it.", "success")
+end)
 
 -- Fetch guild rank once on startup from the main thread (delays are safe here)
 fetchGuildRank()
