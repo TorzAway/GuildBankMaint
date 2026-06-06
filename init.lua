@@ -1,8 +1,9 @@
 -- =============================================================================
--- gbank_helper.lua
+-- GuildBankMaintainance.lua
 -- Guild Bank Automation Script for MacroQuest (MQ Lua)
--- Save as `gbank_helper.lua` in your MacroQuest `lua` folder.
--- Run in-game with: /lua run gbank_helper
+-- Version 4.5
+-- Save as `GuildBankMaintainance.lua` in your MacroQuest `lua` folder.
+-- Run in-game with: /lua run GuildBankMaintainance
 -- =============================================================================
 --
 -- OVERVIEW
@@ -45,6 +46,12 @@
 --                   EQ naming conventions auto-detected:
 --                     "Spell: *", "Song: *", "Tome of *", "Tome: *",
 --                     "Skill: *", items containing "Rk. I/II/III"
+-- anguishMatInfo  : Lookup table keyed by Anguish Mat name. Each entry holds:
+--                     armor = armor archetype (Plate/Chain/Silk/Leather)
+--                     slot  = inventory slot the mat crafts (Head/Arms/Chest/
+--                             Wrist/Hands/Legs/Feet)
+--                   Used to populate the Armor Type and Slot columns in the
+--                   Anguish Mats picker window.
 --
 -- =============================================================================
 -- FUNCTION REFERENCE
@@ -101,8 +108,10 @@
 --   Internal shared scan engine. Walks GBANK_ItemList, calls matchFn() on
 --   each item name, groups stacks of the same item, and populates scanResults
 --   and selectedForWithdrawal (all unchecked by default). Sets pickerWindowTitle,
---   pickerActionLabel, and pickerMode ("withdraw"/"deposit"). Opens the picker
---   window if any matches are found. Does NOT move or touch any items.
+--   pickerActionLabel, and pickerMode ("withdraw"/"deposit"). For Anguish Mat
+--   matches, also looks up armor archetype and slot from anguishMatInfo and
+--   stores them in the entry. Opens the picker window if any matches are found.
+--   Does NOT move or touch any items.
 --
 -- scanBankAnguish()
 --   Calls doScan with isAnguishMatItem for the Anguish Mats GET picker.
@@ -120,7 +129,8 @@
 --   Populates scanResults for the deposit picker (pickerMode = "deposit").
 --
 -- scanInventoryAnguish()
---   Walks bag slots 23-32, runs isAnguishMatItem on each sub-slot.
+--   Walks bag slots 23-32, runs isAnguishMatItem on each sub-slot. Looks up
+--   armor archetype and slot from anguishMatInfo for each match.
 --   Populates scanResults for the deposit picker (pickerMode = "deposit").
 --
 -- scanInventoryForCategory()
@@ -185,8 +195,15 @@
 -- pickerGUI()
 --   Renders a second floating ImGui window (independent of the main window).
 --   Displays scanResults as checkboxes, all unchecked by default.
---   Shows a "Req. Level" column for Spells category scans.
 --   Provides Select All / Deselect All shortcuts and a scrollable list.
+--   Column layout varies by category:
+--     Anguish Mats : Item | Armor Type | Slot  (3 columns)
+--     Spells       : Item | Req. Level         (2 columns)
+--   All visible columns are sortable — clicking a column header sorts by that
+--   field ascending; clicking again reverses to descending. The active sort
+--   column shows a [^] (ascending) or [v] (descending) chevron in its header.
+--   Sort state is maintained in pickerSortCol and pickerSortAsc. A stable
+--   secondary sort by item name is applied when primary values are equal.
 --   Confirm button (label from pickerActionLabel) builds withdrawQueue or
 --   depositQueue from checked entries, sets the appropriate engine flag,
 --   and closes the window immediately.
@@ -277,7 +294,7 @@ end
 
 
 -- Global script states
-local version = "4.3"
+local version = "4.5"
 local openGUI = true
 local shouldDraw = true
 local windowCollapsed    = false  -- true while /gbmhide has collapsed the main window
@@ -309,6 +326,8 @@ local depositQueue        = {}    -- ordered list of names to deposit after conf
 local isPruning           = false -- true while PRUNE SPELLS withdrawal is running
 local pendingPrune        = false -- true when nav workflow should start prune at step 4
 local pruneAction         = 1    -- 1 = autoinventory, 2 = destroy
+local pickerSortCol       = "name" -- active sort column: "name" | "armor" | "slot" | "level"
+local pickerSortAsc       = true   -- true = ascending, false = descending
 local isPromoting         = false -- true while PROMOTE public-access sweep is running
 local pendingPromote      = false -- true when nav workflow should start promote at step 4
 local PRUNE_LEVEL_CUTOFF  = 65   -- withdraw spells below this level
@@ -324,6 +343,43 @@ local itemTargetList = {
     "Quality Feran Hide", "Spiked Discordling Collar", "Blackened Discordling Tail",
     "Ceremonial Dragorn Candle", "Crystal of Yearning", "Kyv Food Sack",
     "Kyv Hunter Ring", "Large Piece of Kuuan Ore", "Noc Right Hand"
+}
+
+-- Anguish Mat info table for visible armor crafting (Omens of War).
+-- Each entry holds: armor archetype and inventory slot.
+local anguishMatInfo = {
+    --	Plate
+	["Kyv Food Sack"] 				 = { armor = "Plate",   slot = "Head"  },
+	["Noc Right Hand"]        		 = { armor = "Plate",   slot = "Arms" },
+	["Large Piece of Kuuan Ore"]     = { armor = "Plate",   slot = "Wrist"  },
+	["Crystal of Yearning"]          = { armor = "Plate",   slot = "Hands" },
+	["Ceremonial Dragorn Candle"]    = { armor = "Plate",   slot = "Chest" },
+	["Blackened Discordling Tail"]   = { armor = "Plate",   slot = "Legs"  },
+	["Kyv Hunter Ring"]          	 = { armor = "Plate",   slot = "Feet"  },
+    --  Chain
+	["Kyv Scout Ring"] 				 = { armor = "Chain",   slot = "Head"  },
+	["Ikaav Head"]        			 = { armor = "Chain",   slot = "Arms" },
+	["Withered Discordling Tongue"]  = { armor = "Chain",   slot = "Wrist"  },
+	["Kyv Whetstone"]         		 = { armor = "Chain",   slot = "Hands" },
+	["Kyv Short Bow"]   			 = { armor = "Chain",   slot = "Chest" },
+	["Shattered Ukun Hide"]  		 = { armor = "Chain",   slot = "Legs"  },
+	["Dragorn Muramite Ring"]        = { armor = "Chain",   slot = "Feet"  },
+	--  Leather
+	["Muramite Noble's March Award"] = { armor = "Leather",   slot = "Head"  },
+	["Spiked Discordling Collar"]    = { armor = "Leather",   slot = "Arms" },
+	["Quality Feran Hide"]    		 = { armor = "Leather",   slot = "Wrist"  },
+	["Fine Chimera Hide"]         	 = { armor = "Leather",   slot = "Hands" },
+	["Bazu Nail Bracelet"]   		 = { armor = "Leather",   slot = "Chest" },
+	["Discordling Hoof"]  			 = { armor = "Leather",   slot = "Legs"  },	
+	["Chimera Gut String"]         	 = { armor = "Leather",   slot = "Feet"  },
+	--  Silk
+	["Bar of Nashtar Berry Soap"]	= { armor = "Silk",   slot = "Head"  },	
+	["Spool of Balemoon Silk"]   	= { armor = "Silk",   slot = "Arms" },
+	["Riftseeker Trinket"]    		= { armor = "Silk",   slot = "Wrist"  },
+	["Kuuan Whetstone"]         	= { armor = "Silk",   slot = "Hands" },
+	["Piece of Vrenlar Fruit"]   	= { armor = "Silk",   slot = "Chest" },
+	["Softened Feran Hide"]  		= { armor = "Silk",   slot = "Legs"  },
+	["Ikaav Tail"]          		= { armor = "Silk",   slot = "Feet"  },
 }
 
 -- Configuration List: Spells / Songs / Skills / Tomes
@@ -562,7 +618,8 @@ local function doScan(matchFn, windowTitle, actionLabel, mode, logTag)
                         return 0
                     end)
                     if ok and result and result > 0 then lvl = result end
-                    table.insert(scanResults, { name = cleanName, slots = { i }, level = lvl })
+                    local matInfo  = anguishMatInfo[cleanName] or {}
+                    table.insert(scanResults, { name = cleanName, slots = { i }, level = lvl, class = matInfo.armor or "", slot = matInfo.slot or "" })
                     selectedForWithdrawal[cleanName] = false -- unchecked by default
                 end
             end
@@ -710,10 +767,13 @@ local function scanInventoryAnguish()
                             end
                         end
                         if not grouped then
+                            local matInfo  = anguishMatInfo[cleanName] or {}
                             table.insert(scanResults, {
                                 name  = cleanName,
                                 slots = { string.format("bag%d-slot%d", bag, slot) },
-                                level = 0
+                                level = 0,
+                                class = matInfo.armor or "",
+                                slot  = matInfo.slot  or "",
                             })
                             selectedForWithdrawal[cleanName] = false
                         end
@@ -1113,30 +1173,98 @@ local function pickerGUI()
             ImGui.Separator()
 
             local showLevel  = (selectedCategory == 2) -- only spells have meaningful levels
-            local listWidth  = showLevel and 460 or 360
+            local showClass  = (selectedCategory == 1) -- only Anguish Mats have armor/slot columns
+            local extraColW  = 130                      -- width for the Level / Armor Type columns
+            local slotColW   = 70                       -- width for the Slot column
+            local listWidth  = showLevel  and (360 + extraColW)
+                            or showClass  and (360 + extraColW + slotColW)
+                            or 360
             local listHeight = math.min(#scanResults * 24 + 8, 300)
 
+            -- Sort chevron helper: returns " [^]" / " [v]" on the active col, "" otherwise
+            local function sortArrow(col)
+                if pickerSortCol ~= col then return "" end
+                return pickerSortAsc and " [^]" or " [v]"
+            end
+
+            -- Click a header button: toggle direction if same col, else switch col asc
+            local function handleSortClick(col)
+                if pickerSortCol == col then
+                    pickerSortAsc = not pickerSortAsc
+                else
+                    pickerSortCol = col
+                    pickerSortAsc = true
+                end
+            end
+
+            -- Render sortable column headers (outside the scrollable child)
             if showLevel then
                 ImGui.Columns(2, "PickerHdrCols", false)
                 ImGui.SetColumnWidth(0, 360)
-                ImGui.SetColumnWidth(1, 90)
-                ImGui.TextColored(0.7, 0.7, 0.7, 1.0, "Item")
+                ImGui.SetColumnWidth(1, extraColW)
+                if ImGui.Button("Item" .. sortArrow("name"), ImVec2(350, 0)) then handleSortClick("name") end
                 ImGui.NextColumn()
-                ImGui.TextColored(0.7, 0.7, 0.7, 1.0, "Req. Level")
+                if ImGui.Button("Req. Level" .. sortArrow("level"), ImVec2(extraColW - 8, 0)) then handleSortClick("level") end
                 ImGui.NextColumn()
                 ImGui.Columns(1)
                 ImGui.Separator()
+            elseif showClass then
+                ImGui.Columns(3, "PickerHdrCols", false)
+                ImGui.SetColumnWidth(0, 360)
+                ImGui.SetColumnWidth(1, extraColW)
+                ImGui.SetColumnWidth(2, slotColW)
+                if ImGui.Button("Item" .. sortArrow("name"),  ImVec2(350, 0))          then handleSortClick("name")  end
+                ImGui.NextColumn()
+                if ImGui.Button("Armor Type" .. sortArrow("armor"), ImVec2(extraColW - 8, 0)) then handleSortClick("armor") end
+                ImGui.NextColumn()
+                if ImGui.Button("Slot" .. sortArrow("slot"),  ImVec2(slotColW - 8, 0)) then handleSortClick("slot")  end
+                ImGui.NextColumn()
+                ImGui.Columns(1)
+                ImGui.Separator()
+            else
+                if ImGui.Button("Item" .. sortArrow("name"), ImVec2(350, 0)) then handleSortClick("name") end
+                ImGui.Separator()
             end
+
+            -- Build a sorted view (shallow copy so scanResults order is preserved for queuing)
+            local sorted = {}
+            for _, e in ipairs(scanResults) do table.insert(sorted, e) end
+            table.sort(sorted, function(a, b)
+                local av, bv
+                if pickerSortCol == "level" then
+                    av = a.level or 0
+                    bv = b.level or 0
+                elseif pickerSortCol == "armor" then
+                    av = (a.class or ""):lower()
+                    bv = (b.class or ""):lower()
+                elseif pickerSortCol == "slot" then
+                    av = (a.slot or ""):lower()
+                    bv = (b.slot or ""):lower()
+                else -- "name"
+                    av = a.name:lower()
+                    bv = b.name:lower()
+                end
+                if av == bv then
+                    -- secondary sort: always ascending by name to keep order stable
+                    return a.name:lower() < b.name:lower()
+                end
+                if pickerSortAsc then return av < bv else return av > bv end
+            end)
 
             ImGui.BeginChild("PickerList", listWidth, listHeight, false)
 
             if showLevel then
                 ImGui.Columns(2, "PickerCols", false)
                 ImGui.SetColumnWidth(0, 360)
-                ImGui.SetColumnWidth(1, 90)
+                ImGui.SetColumnWidth(1, extraColW)
+            elseif showClass then
+                ImGui.Columns(3, "PickerCols", false)
+                ImGui.SetColumnWidth(0, 360)
+                ImGui.SetColumnWidth(1, extraColW)
+                ImGui.SetColumnWidth(2, slotColW)
             end
 
-            for _, entry in ipairs(scanResults) do
+            for _, entry in ipairs(sorted) do
                 local checked    = selectedForWithdrawal[entry.name] or false
                 local stackInfo  = #entry.slots > 1 and string.format("  (%d stacks)", #entry.slots) or ""
                 local label      = entry.name .. stackInfo
@@ -1149,10 +1277,16 @@ local function pickerGUI()
                     local lvlStr = (entry.level and entry.level > 0) and tostring(entry.level) or "-"
                     ImGui.Text(lvlStr)
                     ImGui.NextColumn()
+                elseif showClass then
+                    ImGui.NextColumn()
+                    ImGui.Text((entry.class and entry.class ~= "") and entry.class or "-")
+                    ImGui.NextColumn()
+                    ImGui.Text((entry.slot  and entry.slot  ~= "") and entry.slot  or "-")
+                    ImGui.NextColumn()
                 end
             end
 
-            if showLevel then
+            if showLevel or showClass then
                 ImGui.Columns(1)
             end
 

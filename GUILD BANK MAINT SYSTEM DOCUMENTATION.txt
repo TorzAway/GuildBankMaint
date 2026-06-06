@@ -1,8 +1,9 @@
 -- =============================================================================
--- GuildBankMaint - Management Tool
+-- GuildBankMaintainance.lua
 -- Guild Bank Automation Script for MacroQuest (MQ Lua)
--- Save as `\GuildBankMaint\init.lua` in your MacroQuest `lua` folder.
--- Run in-game with: /lua run gbank_helper
+-- Version 4.5
+-- Save as `GuildBankMaintainance.lua` in your MacroQuest `lua` folder.
+-- Run in-game with: /lua run GuildBankMaintainance
 -- =============================================================================
 --
 -- OVERVIEW
@@ -29,6 +30,15 @@
 -- 6. If the bank is not open, the script will navigate to the Guild Treasurer.
 -- 7. A picker window will appear — select items and confirm.
 --
+-- WINDOW COMMANDS
+-- ---------------
+-- /gbmhide  Collapse the main UI window to its title bar.
+-- /gbmshow  Restore the main UI window to full size.
+-- (Clicking the ImGui chevron also toggles collapse; both methods notify chat.)
+--
+-- EXIT SCRIPT button closes the guild bank window, inventory window, and any
+-- open bag windows before terminating the script.
+--
 -- ITEM LISTS
 -- ----------
 -- itemTargetList  : Anguish Mat items matched by exact name for GET/GIVE.
@@ -36,6 +46,12 @@
 --                   EQ naming conventions auto-detected:
 --                     "Spell: *", "Song: *", "Tome of *", "Tome: *",
 --                     "Skill: *", items containing "Rk. I/II/III"
+-- anguishMatInfo  : Lookup table keyed by Anguish Mat name. Each entry holds:
+--                     armor = armor archetype (Plate/Chain/Silk/Leather)
+--                     slot  = inventory slot the mat crafts (Head/Arms/Chest/
+--                             Wrist/Hands/Legs/Feet)
+--                   Used to populate the Armor Type and Slot columns in the
+--                   Anguish Mats picker window.
 --
 -- =============================================================================
 -- FUNCTION REFERENCE
@@ -92,8 +108,10 @@
 --   Internal shared scan engine. Walks GBANK_ItemList, calls matchFn() on
 --   each item name, groups stacks of the same item, and populates scanResults
 --   and selectedForWithdrawal (all unchecked by default). Sets pickerWindowTitle,
---   pickerActionLabel, and pickerMode ("withdraw"/"deposit"). Opens the picker
---   window if any matches are found. Does NOT move or touch any items.
+--   pickerActionLabel, and pickerMode ("withdraw"/"deposit"). For Anguish Mat
+--   matches, also looks up armor archetype and slot from anguishMatInfo and
+--   stores them in the entry. Opens the picker window if any matches are found.
+--   Does NOT move or touch any items.
 --
 -- scanBankAnguish()
 --   Calls doScan with isAnguishMatItem for the Anguish Mats GET picker.
@@ -111,7 +129,8 @@
 --   Populates scanResults for the deposit picker (pickerMode = "deposit").
 --
 -- scanInventoryAnguish()
---   Walks bag slots 23-32, runs isAnguishMatItem on each sub-slot.
+--   Walks bag slots 23-32, runs isAnguishMatItem on each sub-slot. Looks up
+--   armor archetype and slot from anguishMatInfo for each match.
 --   Populates scanResults for the deposit picker (pickerMode = "deposit").
 --
 -- scanInventoryForCategory()
@@ -176,8 +195,15 @@
 -- pickerGUI()
 --   Renders a second floating ImGui window (independent of the main window).
 --   Displays scanResults as checkboxes, all unchecked by default.
---   Shows a "Req. Level" column for Spells category scans.
 --   Provides Select All / Deselect All shortcuts and a scrollable list.
+--   Column layout varies by category:
+--     Anguish Mats : Item | Armor Type | Slot  (3 columns)
+--     Spells       : Item | Req. Level         (2 columns)
+--   All visible columns are sortable — clicking a column header sorts by that
+--   field ascending; clicking again reverses to descending. The active sort
+--   column shows a [^] (ascending) or [v] (descending) chevron in its header.
+--   Sort state is maintained in pickerSortCol and pickerSortAsc. A stable
+--   secondary sort by item name is applied when primary values are equal.
 --   Confirm button (label from pickerActionLabel) builds withdrawQueue or
 --   depositQueue from checked entries, sets the appropriate engine flag,
 --   and closes the window immediately.
@@ -210,8 +236,23 @@
 --     - Separator
 --     - Status line (color-coded by current operation)
 --     - Separator
---     - EXIT SCRIPT button (centered, red)
+--     - EXIT SCRIPT button (centered, red): stops all automation, closes
+--       GuildBankWnd, InventoryWindow, and any open Pack1-Pack10, then exits.
 --   Also calls pickerGUI() each frame to render the picker popup if open.
+--   Collapse state is tracked each frame; clicking the ImGui chevron directly
+--   also notifies chat with the appropriate /gbmshow or /gbmhide command hint.
+--
+-- WINDOW VISIBILITY BINDS
+-- -----------------------
+-- /gbmhide
+--   Collapses the main window to its title bar, identical to clicking the
+--   ImGui chevron. Notifies chat and echoes /gbmshow as the restore command.
+--   Has no effect (warns) if the window is already collapsed.
+--
+-- /gbmshow
+--   Restores a collapsed main window to its full size. Notifies chat and
+--   echoes /gbmhide as the hide command. Has no effect (warns) if already visible.
+--   Works whether the window was collapsed by /gbmhide or the chevron.
 --
 -- PRIMARY EXECUTION ENGINE
 -- ------------------------
