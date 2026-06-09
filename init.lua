@@ -1,9 +1,9 @@
 -- =============================================================================
--- GuildBankMaintainance.lua
+-- gbank_helper.lua
 -- Guild Bank Automation Script for MacroQuest (MQ Lua)
--- Version 4.5
--- Save as `GuildBankMaintainance.lua` in your MacroQuest `lua` folder.
--- Run in-game with: /lua run GuildBankMaintainance
+-- Version 4.6
+-- Save as `gbank_helper.lua` in your MacroQuest `lua` folder.
+-- Run in-game with: /lua run gbank_helper
 -- =============================================================================
 --
 -- OVERVIEW
@@ -107,7 +107,8 @@
 -- doScan(matchFn, windowTitle, actionLabel, mode, logTag)
 --   Internal shared scan engine. Walks GBANK_ItemList, calls matchFn() on
 --   each item name, groups stacks of the same item, and populates scanResults
---   and selectedForWithdrawal (all unchecked by default). Sets pickerWindowTitle,
+--   and selectedForWithdrawal (all unchecked by default). Each entry stores
+--   qty = total item count across all matching stacks. Sets pickerWindowTitle,
 --   pickerActionLabel, and pickerMode ("withdraw"/"deposit"). For Anguish Mat
 --   matches, also looks up armor archetype and slot from anguishMatInfo and
 --   stores them in the entry. Opens the picker window if any matches are found.
@@ -197,16 +198,21 @@
 --   Displays scanResults as checkboxes, all unchecked by default.
 --   Provides Select All / Deselect All shortcuts and a scrollable list.
 --   Column layout varies by category:
---     Anguish Mats : Item | Armor Type | Slot  (3 columns)
---     Spells       : Item | Req. Level         (2 columns)
+--     Anguish Mats : Item | Armor Type | Slot | Qty  (4 columns)
+--     Spells       : Item | Req. Level  | Qty  (3 columns)
+--     Other        : Item | Qty                (2 columns)
+--   The Qty column shows "current / total" for each item. When an item is
+--   checked, [-] and [+] buttons let the user pick exactly how many to
+--   transfer (clamped 1 to total available). selectedQty[name] stores the
+--   chosen amount; it defaults to the full qty when an item is first checked.
 --   All visible columns are sortable — clicking a column header sorts by that
 --   field ascending; clicking again reverses to descending. The active sort
 --   column shows a [^] (ascending) or [v] (descending) chevron in its header.
 --   Sort state is maintained in pickerSortCol and pickerSortAsc. A stable
 --   secondary sort by item name is applied when primary values are equal.
 --   Confirm button (label from pickerActionLabel) builds withdrawQueue or
---   depositQueue from checked entries, sets the appropriate engine flag,
---   and closes the window immediately.
+--   depositQueue from checked entries as {name, qty} tables, sets the
+--   appropriate engine flag, and closes the window immediately.
 --
 -- GUILD RANK LOOKUP
 -- -----------------
@@ -294,7 +300,7 @@ end
 
 
 -- Global script states
-local version = "4.5"
+local version = "4.6"
 local openGUI = true
 local shouldDraw = true
 local windowCollapsed    = false  -- true while /gbmhide has collapsed the main window
@@ -317,8 +323,9 @@ local showPickerWindow    = false -- controls the item selection popup
 local pickerWindowTitle   = ""    -- set by whichever scan opens the picker
 local pickerActionLabel   = ""    -- button label: "Withdraw Selected" or "Deposit Selected"
 local pickerMode          = ""    -- "withdraw" | "deposit" — drives which engine runs
-local scanResults         = {}    -- { { name=string, slots={int,...} } ... }
+local scanResults         = {}    -- { { name=string, slots={int,...}, qty=int } ... }
 local selectedForWithdrawal = {}  -- keyed by name -> bool; false = unchecked (default)
+local selectedQty         = {}    -- keyed by name -> int; how many the user wants to transfer
 local isWithdrawingPicked = false
 local withdrawQueue       = {}    -- ordered list of names to withdraw after confirmation
 local isDepositingPicked  = false
@@ -573,6 +580,7 @@ end
 local function doScan(matchFn, windowTitle, actionLabel, mode, logTag)
     scanResults           = {}
     selectedForWithdrawal = {}
+    selectedQty           = {}
     pickerWindowTitle     = windowTitle
     pickerActionLabel     = actionLabel
     pickerMode            = mode
@@ -590,11 +598,15 @@ local function doScan(matchFn, windowTitle, actionLabel, mode, logTag)
         if itemText and itemText ~= "" then
             if matchFn(itemText) then
                 local cleanName = itemText:gsub("^%s*(.-)%s*$", "%1")
+                -- Read stack count from column 3 (defaults to 1 if blank/nil)
+                local stackStr  = mq.TLO.Window('GuildBankWnd').Child('GBANK_ItemList').List(i, 3)()
+                local stackSize = tonumber(stackStr) or 1
                 -- Group stacks of the same name into one entry
                 local grouped = false
                 for _, entry in ipairs(scanResults) do
                     if entry.name == cleanName then
                         table.insert(entry.slots, i)
+                        entry.qty = (entry.qty or 0) + stackSize
                         grouped = true
                         break
                     end
@@ -619,8 +631,9 @@ local function doScan(matchFn, windowTitle, actionLabel, mode, logTag)
                     end)
                     if ok and result and result > 0 then lvl = result end
                     local matInfo  = anguishMatInfo[cleanName] or {}
-                    table.insert(scanResults, { name = cleanName, slots = { i }, level = lvl, class = matInfo.armor or "", slot = matInfo.slot or "" })
+                    table.insert(scanResults, { name = cleanName, slots = { i }, qty = stackSize, level = lvl, class = matInfo.armor or "", slot = matInfo.slot or "" })
                     selectedForWithdrawal[cleanName] = false -- unchecked by default
+                    selectedQty[cleanName]           = stackSize -- default: take all
                 end
             end
         end
@@ -668,6 +681,7 @@ end
 local function scanInventorySpells()
     scanResults           = {}
     selectedForWithdrawal = {}
+    selectedQty           = {}
     pickerWindowTitle     = "Spells / Songs / Skills / Tomes - Select Items to Deposit"
     pickerActionLabel     = "Deposit Selected"
     pickerMode            = "deposit"
@@ -689,11 +703,13 @@ local function scanInventorySpells()
                     local itemName = item.Name()
                     if itemName and isSpellItem(itemName) then
                         local cleanName = itemName:gsub("^%s*(.-)%s*$", "%1")
+                        local stackSize = item.Stack() or 1
                         -- Group duplicates (shouldn't occur in bags but be safe)
                         local grouped = false
                         for _, entry in ipairs(scanResults) do
                             if entry.name == cleanName then
                                 table.insert(entry.slots, string.format("bag%d-slot%d", bag, slot))
+                                entry.qty = (entry.qty or 0) + stackSize
                                 grouped = true
                                 break
                             end
@@ -717,9 +733,11 @@ local function scanInventorySpells()
                             table.insert(scanResults, {
                                 name  = cleanName,
                                 slots = { string.format("bag%d-slot%d", bag, slot) },
+                                qty   = stackSize,
                                 level = lvl
                             })
                             selectedForWithdrawal[cleanName] = false
+                            selectedQty[cleanName]           = stackSize
                             found = found + 1
                         end
                     end
@@ -742,6 +760,7 @@ end
 local function scanInventoryAnguish()
     scanResults           = {}
     selectedForWithdrawal = {}
+    selectedQty           = {}
     pickerWindowTitle     = "Anguish Mats - Select Items to Deposit"
     pickerActionLabel     = "Deposit Selected"
     pickerMode            = "deposit"
@@ -758,10 +777,12 @@ local function scanInventoryAnguish()
                     local itemName = item.Name()
                     if itemName and isAnguishMatItem(itemName) then
                         local cleanName = itemName:gsub("^%s*(.-)%s*$", "%1")
+                        local stackSize = item.Stack() or 1
                         local grouped = false
                         for _, entry in ipairs(scanResults) do
                             if entry.name == cleanName then
                                 table.insert(entry.slots, string.format("bag%d-slot%d", bag, slot))
+                                entry.qty = (entry.qty or 0) + stackSize
                                 grouped = true
                                 break
                             end
@@ -771,11 +792,13 @@ local function scanInventoryAnguish()
                             table.insert(scanResults, {
                                 name  = cleanName,
                                 slots = { string.format("bag%d-slot%d", bag, slot) },
+                                qty   = stackSize,
                                 level = 0,
                                 class = matInfo.armor or "",
                                 slot  = matInfo.slot  or "",
                             })
                             selectedForWithdrawal[cleanName] = false
+                            selectedQty[cleanName]           = stackSize
                         end
                     end
                 end
@@ -821,7 +844,9 @@ local function handlePickedWithdrawal()
     end
 
     while #withdrawQueue > 0 do
-        local targetName = withdrawQueue[1]
+        local entry      = withdrawQueue[1]
+        local targetName = type(entry) == "table" and entry.name or entry
+        local wantQty    = type(entry) == "table" and (entry.qty or 1) or 1
 
         -- Re-scan live slot list (indices shift after each withdrawal)
         local itemsCount = mq.TLO.Window('GuildBankWnd').Child('GBANK_ItemList').Items() or 0
@@ -835,13 +860,38 @@ local function handlePickedWithdrawal()
         end
 
         if foundSlot then
-            notify("GBank Withdraw", "Withdrawing " .. hilite(targetName) .. " from slot " .. hilite(foundSlot) .. "...", "action")
+            -- Read current stack size so we know how much this pull takes
+            local stackStr  = mq.TLO.Window('GuildBankWnd').Child('GBANK_ItemList').List(foundSlot, 3)()
+            local stackSize = tonumber(stackStr) or 1
+
+            notify("GBank Withdraw", "Withdrawing " .. hilite(targetName) ..
+                " from slot " .. hilite(foundSlot) ..
+                " (want " .. hilite(wantQty) .. ", stack " .. hilite(stackSize) .. ")...", "action")
             mq.cmd(string.format("/notify GuildBankWnd GBANK_ItemList listselect %d", foundSlot))
             mq.delay(200)
             mq.cmd("/notify GuildBankWnd GBANK_WithdrawButton leftmouseup")
             mq.delay(300)
 
-            handleQuantityWindow()
+            -- For partial-stack withdrawals: if the stack is larger than needed,
+            -- the QuantityWnd will appear — set it to wantQty instead of max.
+            if mq.TLO.Window('QuantityWnd').Open() then
+                if wantQty >= stackSize then
+                    -- Take the whole stack (or all we still need)
+                    notify("GBank", "Quantity window: taking full stack (" .. hilite(stackSize) .. ").", "info")
+                    mq.cmd("/notify QuantityWnd QTYW_Slider newvalue 100")
+                else
+                    -- Take only as many as requested
+                    notify("GBank", "Quantity window: setting to " .. hilite(wantQty) .. ".", "info")
+                    mq.cmd(string.format("/notify QuantityWnd QTYW_Slider newvalue %d", wantQty))
+                end
+                mq.delay(150)
+                mq.cmd("/notify QuantityWnd QTYW_Accept_Button leftmouseup")
+                mq.delay(200)
+                local timeout = os.clock() + 2.0
+                while not mq.TLO.Cursor() and os.clock() < timeout do mq.delay(50) end
+            else
+                handleQuantityWindow()
+            end
 
             lastActionTime = os.clock() * 1000
             mq.delay(400)
@@ -851,17 +901,33 @@ local function handlePickedWithdrawal()
                 mq.delay(300)
             end
 
-            -- Advance queue only when this name is fully gone from the bank
-            local stillPresent = false
-            local countAfter = mq.TLO.Window('GuildBankWnd').Child('GBANK_ItemList').Items() or 0
-            for i = 1, countAfter do
-                local txt = mq.TLO.Window('GuildBankWnd').Child('GBANK_ItemList').List(i, 2)()
-                if txt then
-                    local clean = txt:gsub("^%s*(.-)%s*$", "%1")
-                    if clean == targetName then stillPresent = true break end
+            -- Subtract what we just pulled from the remaining want-qty.
+            -- If satisfied (or the item is gone from the bank), advance the queue.
+            local pulled = math.min(wantQty, stackSize)
+            local remaining = wantQty - pulled
+
+            if remaining <= 0 then
+                table.remove(withdrawQueue, 1)
+            else
+                -- Still need more — update the qty on the queue entry and loop
+                if type(withdrawQueue[1]) == "table" then
+                    withdrawQueue[1].qty = remaining
+                end
+                -- Check the item is still in the bank before looping
+                local stillPresent = false
+                local countAfter = mq.TLO.Window('GuildBankWnd').Child('GBANK_ItemList').Items() or 0
+                for i = 1, countAfter do
+                    local txt = mq.TLO.Window('GuildBankWnd').Child('GBANK_ItemList').List(i, 2)()
+                    if txt then
+                        local clean = txt:gsub("^%s*(.-)%s*$", "%1")
+                        if clean == targetName then stillPresent = true break end
+                    end
+                end
+                if not stillPresent then
+                    notify("GBank Withdraw", hilite(targetName) .. " depleted in bank before qty satisfied. Advancing.", "warn")
+                    table.remove(withdrawQueue, 1)
                 end
             end
-            if not stillPresent then table.remove(withdrawQueue, 1) end
             return -- yield to main loop for throttle / cursor safety
         else
             notify("GBank Withdraw", hilite(targetName) .. " not found in bank. Skipping.", "warn")
@@ -978,11 +1044,14 @@ local function handlePickedDeposit()
     end
 
     if #depositQueue > 0 then
-        local targetName = depositQueue[1]
+        local entry      = depositQueue[1]
+        local targetName = type(entry) == "table" and entry.name or entry
+        local wantQty    = type(entry) == "table" and (entry.qty or 1) or 1
         local item = mq.TLO.FindItem(string.format("=%s", targetName))
 
         if item and item() then
-            notify("GBank Deposit", "Depositing " .. hilite(targetName) .. "...", "action")
+            notify("GBank Deposit", "Depositing " .. hilite(targetName) ..
+                " (want " .. hilite(wantQty) .. ")...", "action")
             mq.cmd(string.format("/shift /itemnotify \"%s\" leftmouseup", targetName))
             mq.delay(400)
 
@@ -992,10 +1061,16 @@ local function handlePickedDeposit()
                 mq.delay(400)
             end
 
-            -- Check if item still exists in inventory; if not, advance queue
-            local still = mq.TLO.FindItem(string.format("=%s", targetName))
-            if not (still and still()) then
+            -- Decrement wantQty by 1 (we deposit one stack/item per tick).
+            -- Advance queue when satisfied or when no more of this item exist in inventory.
+            local newWant = wantQty - 1
+            local still   = mq.TLO.FindItem(string.format("=%s", targetName))
+            if newWant <= 0 or not (still and still()) then
                 table.remove(depositQueue, 1)
+            else
+                if type(depositQueue[1]) == "table" then
+                    depositQueue[1].qty = newWant
+                end
             end
         else
             notify("GBank Deposit", hilite(targetName) .. " not found in inventory. Skipping.", "warn")
@@ -1176,10 +1251,11 @@ local function pickerGUI()
             local showClass  = (selectedCategory == 1) -- only Anguish Mats have armor/slot columns
             local extraColW  = 130                      -- width for the Level / Armor Type columns
             local slotColW   = 70                       -- width for the Slot column
-            local listWidth  = showLevel  and (360 + extraColW)
-                            or showClass  and (360 + extraColW + slotColW)
-                            or 360
-            local listHeight = math.min(#scanResults * 24 + 8, 300)
+            local qtyColW    = 140                      -- width for the Qty / input column (needs room for "99 / 99 [-][+]")
+            local listWidth  = showLevel  and (360 + extraColW + qtyColW)
+                            or showClass  and (360 + extraColW + slotColW + qtyColW)
+                            or (360 + qtyColW)
+            local listHeight = math.min(#scanResults * 26 + 8, 300)
 
             -- Sort chevron helper: returns " [^]" / " [v]" on the active col, "" otherwise
             local function sortArrow(col)
@@ -1199,30 +1275,43 @@ local function pickerGUI()
 
             -- Render sortable column headers (outside the scrollable child)
             if showLevel then
-                ImGui.Columns(2, "PickerHdrCols", false)
+                ImGui.Columns(3, "PickerHdrCols", false)
                 ImGui.SetColumnWidth(0, 360)
                 ImGui.SetColumnWidth(1, extraColW)
+                ImGui.SetColumnWidth(2, qtyColW)
                 if ImGui.Button("Item" .. sortArrow("name"), ImVec2(350, 0)) then handleSortClick("name") end
                 ImGui.NextColumn()
                 if ImGui.Button("Req. Level" .. sortArrow("level"), ImVec2(extraColW - 8, 0)) then handleSortClick("level") end
                 ImGui.NextColumn()
+                ImGui.Text("Qty")
+                ImGui.NextColumn()
                 ImGui.Columns(1)
                 ImGui.Separator()
             elseif showClass then
-                ImGui.Columns(3, "PickerHdrCols", false)
+                ImGui.Columns(4, "PickerHdrCols", false)
                 ImGui.SetColumnWidth(0, 360)
                 ImGui.SetColumnWidth(1, extraColW)
                 ImGui.SetColumnWidth(2, slotColW)
+                ImGui.SetColumnWidth(3, qtyColW)
                 if ImGui.Button("Item" .. sortArrow("name"),  ImVec2(350, 0))          then handleSortClick("name")  end
                 ImGui.NextColumn()
                 if ImGui.Button("Armor Type" .. sortArrow("armor"), ImVec2(extraColW - 8, 0)) then handleSortClick("armor") end
                 ImGui.NextColumn()
                 if ImGui.Button("Slot" .. sortArrow("slot"),  ImVec2(slotColW - 8, 0)) then handleSortClick("slot")  end
                 ImGui.NextColumn()
+                ImGui.Text("Qty")
+                ImGui.NextColumn()
                 ImGui.Columns(1)
                 ImGui.Separator()
             else
+                ImGui.Columns(2, "PickerHdrCols", false)
+                ImGui.SetColumnWidth(0, 360)
+                ImGui.SetColumnWidth(1, qtyColW)
                 if ImGui.Button("Item" .. sortArrow("name"), ImVec2(350, 0)) then handleSortClick("name") end
+                ImGui.NextColumn()
+                ImGui.Text("Qty")
+                ImGui.NextColumn()
+                ImGui.Columns(1)
                 ImGui.Separator()
             end
 
@@ -1254,23 +1343,31 @@ local function pickerGUI()
             ImGui.BeginChild("PickerList", listWidth, listHeight, false)
 
             if showLevel then
-                ImGui.Columns(2, "PickerCols", false)
-                ImGui.SetColumnWidth(0, 360)
-                ImGui.SetColumnWidth(1, extraColW)
-            elseif showClass then
                 ImGui.Columns(3, "PickerCols", false)
                 ImGui.SetColumnWidth(0, 360)
                 ImGui.SetColumnWidth(1, extraColW)
+                ImGui.SetColumnWidth(2, qtyColW)
+            elseif showClass then
+                ImGui.Columns(4, "PickerCols", false)
+                ImGui.SetColumnWidth(0, 360)
+                ImGui.SetColumnWidth(1, extraColW)
                 ImGui.SetColumnWidth(2, slotColW)
+                ImGui.SetColumnWidth(3, qtyColW)
+            else
+                ImGui.Columns(2, "PickerCols", false)
+                ImGui.SetColumnWidth(0, 360)
+                ImGui.SetColumnWidth(1, qtyColW)
             end
 
             for _, entry in ipairs(sorted) do
                 local checked    = selectedForWithdrawal[entry.name] or false
-                local stackInfo  = #entry.slots > 1 and string.format("  (%d stacks)", #entry.slots) or ""
-                local label      = entry.name .. stackInfo
-                local newChecked = ImGui.Checkbox(label, checked)
+                local newChecked = ImGui.Checkbox(entry.name, checked)
                 if newChecked ~= checked then
                     selectedForWithdrawal[entry.name] = newChecked
+                    -- When first checked, default qty to the full available amount
+                    if newChecked and (not selectedQty[entry.name] or selectedQty[entry.name] == 0) then
+                        selectedQty[entry.name] = entry.qty or 1
+                    end
                 end
                 if showLevel then
                     ImGui.NextColumn()
@@ -1283,12 +1380,31 @@ local function pickerGUI()
                     ImGui.NextColumn()
                     ImGui.Text((entry.slot  and entry.slot  ~= "") and entry.slot  or "-")
                     ImGui.NextColumn()
+                else
+                    ImGui.NextColumn()
                 end
+                -- Qty spinner: always shown, editable only when checked
+                local totalQty = entry.qty or 1
+                local curQty   = selectedQty[entry.name] or totalQty
+                ImGui.Text(string.format("%d / %d", curQty, totalQty))
+                if checked then
+                    ImGui.SameLine()
+                    ImGui.PushID("qtydown_" .. entry.name)
+                    if ImGui.SmallButton("-") then
+                        selectedQty[entry.name] = math.max(1, curQty - 1)
+                    end
+                    ImGui.PopID()
+                    ImGui.SameLine()
+                    ImGui.PushID("qtyup_" .. entry.name)
+                    if ImGui.SmallButton("+") then
+                        selectedQty[entry.name] = math.min(totalQty, curQty + 1)
+                    end
+                    ImGui.PopID()
+                end
+                ImGui.NextColumn()
             end
 
-            if showLevel or showClass then
-                ImGui.Columns(1)
-            end
+            ImGui.Columns(1)
 
             ImGui.EndChild()
 
@@ -1320,25 +1436,29 @@ local function pickerGUI()
                         depositQueue = {}
                         for _, entry in ipairs(scanResults) do
                             if selectedForWithdrawal[entry.name] then
-                                table.insert(depositQueue, entry.name)
+                                local qty = math.max(1, math.min(selectedQty[entry.name] or entry.qty or 1, entry.qty or 1))
+                                table.insert(depositQueue, { name = entry.name, qty = qty })
                             end
                         end
                         isDepositingPicked    = true
                         showPickerWindow      = false
                         scanResults           = {}
                         selectedForWithdrawal = {}
+                        selectedQty           = {}
                         notify("GBank Deposit", "Queuing " .. hilite(#depositQueue) .. " item type(s) for deposit.", "info")
                     else
                         withdrawQueue = {}
                         for _, entry in ipairs(scanResults) do
                             if selectedForWithdrawal[entry.name] then
-                                table.insert(withdrawQueue, entry.name)
+                                local qty = math.max(1, math.min(selectedQty[entry.name] or entry.qty or 1, entry.qty or 1))
+                                table.insert(withdrawQueue, { name = entry.name, qty = qty })
                             end
                         end
                         isWithdrawingPicked   = true
                         showPickerWindow      = false
                         scanResults           = {}
                         selectedForWithdrawal = {}
+                        selectedQty           = {}
                         notify("GBank Withdraw", "Queuing " .. hilite(#withdrawQueue) .. " item type(s) for withdrawal.", "info")
                     end
                 end
@@ -1349,6 +1469,7 @@ local function pickerGUI()
                     showPickerWindow      = false
                     scanResults           = {}
                     selectedForWithdrawal = {}
+                    selectedQty           = {}
                 end
             end
         end
@@ -1360,6 +1481,7 @@ local function pickerGUI()
         isDepositingPicked  = false
         withdrawQueue       = {}
         depositQueue        = {}
+        selectedQty         = {}
     end
 end
 
