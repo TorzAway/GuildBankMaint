@@ -1,7 +1,7 @@
 -- =============================================================================
 -- gbank_helper.lua
 -- Guild Bank Automation Script for MacroQuest (MQ Lua)
--- Version 4.6
+-- Version 4.7
 -- Save as `gbank_helper.lua` in your MacroQuest `lua` folder.
 -- Run in-game with: /lua run gbank_helper
 -- =============================================================================
@@ -17,7 +17,8 @@
 -- ------------
 -- - MacroQuest with Lua and ImGui support
 -- - MQ Navigation plugin (for auto-pathing to Guild Treasurer)
--- - Guild membership (officer rank required for PROMOTE and PRUNE SPELLS)
+-- - Guild membership (officer rank required for PROMOTE, PRUNE SPELLS,
+--   and MERGE STACKS)
 -- - GuildManagementWnd must be openable in-game
 --
 -- USAGE
@@ -102,6 +103,15 @@
 --   Yields back to the main loop after each withdrawal so slot indices
 --   are re-scanned fresh on the next tick.
 --
+-- MERGE STACKS ENGINE
+-- -------------------
+-- handleMergeStacks()
+--   Called from the main loop while isMerging is true. Walks every row in
+--   GBANK_ItemList, selects it, and clicks GBANK_MergeButton so EQ
+--   consolidates split stacks of each stackable item across the whole vault.
+--   Aborts cleanly if the bank window closes mid-sweep. Sets isMerging = false
+--   on completion. Officer + bank open required.
+--
 -- BANK SCAN CORE
 -- --------------
 -- doScan(matchFn, windowTitle, actionLabel, mode, logTag)
@@ -165,10 +175,15 @@
 -- OFFICER PUBLIC VAULT ROUTINES
 -- ------------------------------
 -- processOfficerPublicVaultRoutines()
---   Officer-only. First promotes all items in the GBANK_DepositList staging area
---   to the main vault. Then walks every row in GBANK_ItemList, reads the
---   permission from column 4, and changes any non-Public item to Public via
---   GBANK_PermissionCombo listselect 4. Only called when cachedIsOfficer is true.
+--   Officer-only. Runs three sequential steps after a deposit operation:
+--   Step 1 — PROMOTE: promotes all items in the GBANK_DepositList staging area
+--     to the main vault by clicking GBANK_PromoteButton for each entry.
+--   Step 2 — PUBLIC SWEEP: walks every row in GBANK_ItemList, reads the
+--     permission from column 4, and changes any non-Public item to Public via
+--     GBANK_PermissionCombo listselect 4.
+--   Step 3 — MERGE STACKS: selects every row in GBANK_ItemList and clicks
+--     GBANK_MergeButton to consolidate split stacks of each stackable item.
+--   Only called when cachedIsOfficer is true.
 --
 -- GIVE MODE (Anguish Mats sweep fallback)
 -- ----------------------------------------
@@ -188,6 +203,7 @@
 --     Step 4: Dispatches based on pending flags and selected mode:
 --               pendingPrune   → sets isPruning   = true
 --               pendingPromote → sets isPromoting  = true
+--               pendingMerge   → sets isMerging    = true
 --               GET mode       → scanBankForCategory()
 --               GIVE mode      → scanInventoryForCategory()
 --
@@ -231,7 +247,8 @@
 --   ImGui render callback registered with mq.imgui.init. Renders the main
 --   "Guild Bank Automator" window on every frame. Layout (top to bottom):
 --     - Guild rank / officer status (color-coded green/orange)
---     - PRUNE SPELLS + PROMOTE buttons (officer only, centered pair)
+--     - PRUNE SPELLS + PROMOTE buttons (officer only, centered on row 1)
+--     - MERGE STACKS button (officer only, centered on row 2)
 --     - Prune action radio: Keep (autoinv) / Destroy
 --     - Separator
 --     - Category radio: Anguish Mats / Spells/Songs/Skills/Tomes
@@ -268,7 +285,8 @@
 --     2. isDepositingPicked  → handlePickedDeposit()
 --     3. isPruning           → handlePruneSpells()   (officer + bank open required)
 --     4. isPromoting         → processOfficerPublicVaultRoutines() (officer + bank open)
---     5. isRunningWorkflow   → processBankWorkflow()
+--     5. isMerging           → handleMergeStacks()   (officer + bank open required)
+--     6. isRunningWorkflow   → processBankWorkflow()
 --
 -- =============================================================================
 
@@ -300,7 +318,7 @@ end
 
 
 -- Global script states
-local version = "4.6"
+local version = "4.7"
 local openGUI = true
 local shouldDraw = true
 local windowCollapsed    = false  -- true while /gbmhide has collapsed the main window
@@ -337,6 +355,8 @@ local pickerSortCol       = "name" -- active sort column: "name" | "armor" | "sl
 local pickerSortAsc       = true   -- true = ascending, false = descending
 local isPromoting         = false -- true while PROMOTE public-access sweep is running
 local pendingPromote      = false -- true when nav workflow should start promote at step 4
+local pendingMerge        = false -- true when nav workflow should start merge at step 4
+local isMerging           = false -- true while MERGE STACKS sweep is running
 local PRUNE_LEVEL_CUTOFF  = 65   -- withdraw spells below this level
 
 -- Configuration List: Anguish Mats
@@ -981,6 +1001,37 @@ local function handleGetMode()
     end
 end
 
+-- ─── Merge Stacks Engine ────────────────────────────────────────────
+
+local function handleMergeStacks()
+    if not mq.TLO.Window('GuildBankWnd').Open() then
+        notify("GBank Merge", "Bank window closed. Aborting.", "error")
+        isMerging = false
+        return
+    end
+    notify("GBank Merge", "Merging stacks for all items in vault...", "officer")
+    local count = mq.TLO.Window('GuildBankWnd').Child('GBANK_ItemList').Items() or 0
+    for i = 1, count do
+        if not isMerging then return end
+        if not mq.TLO.Window('GuildBankWnd').Open() then
+            notify("GBank Merge", "Bank window closed mid-sweep. Aborting.", "error")
+            isMerging = false
+            return
+        end
+        local txt = mq.TLO.Window('GuildBankWnd').Child('GBANK_ItemList').List(i, 2)()
+        local qtyStr = mq.TLO.Window('GuildBankWnd').Child('GBANK_ItemList').List(i, 3)()
+        local qty = tonumber(qtyStr) or 0
+        if txt and txt ~= "" and qty > 0 then
+            mq.cmd(string.format("/notify GuildBankWnd GBANK_ItemList listselect %d", i))
+            mq.delay(200)
+            mq.cmd("/notify GuildBankWnd GBANK_MergeButton leftmouseup")
+            mq.delay(400)
+        end
+    end
+    notify("GBank Merge", "Stack merge complete.", "success")
+    isMerging = false
+end
+
 -- ─── GIVE Mode ────────────────────────────────────────────────────────────────
 
 -- Method A: promote deposit staging items to vault and set all to Public
@@ -1022,7 +1073,27 @@ local function processOfficerPublicVaultRoutines()
         end
     end
 
-    notify("GBank Promote", "Transfer and public-sweep finished successfully!", "success")
+    -- Merge stacks across all vault items
+    local mergeCount = mq.TLO.Window('GuildBankWnd').Child('GBANK_ItemList').Items() or 0
+    if mergeCount > 0 then
+        notify("GBank Promote", "Merging stacks for all items in vault...", "officer")
+        mq.delay(300)
+        for i = 1, mergeCount do
+            if not isRunningWorkflow then return end
+            if not mq.TLO.Window('GuildBankWnd').Open() then return end
+            local txt = mq.TLO.Window('GuildBankWnd').Child('GBANK_ItemList').List(i, 2)()
+            local qtyStr = mq.TLO.Window('GuildBankWnd').Child('GBANK_ItemList').List(i, 3)()
+            local qty = tonumber(qtyStr) or 0
+            if txt and txt ~= "" and qty > 0 then
+                mq.cmd(string.format("/notify GuildBankWnd GBANK_ItemList listselect %d", i))
+                mq.delay(200)
+                mq.cmd("/notify GuildBankWnd GBANK_MergeButton leftmouseup")
+                mq.delay(400)
+            end
+        end
+    end
+
+    notify("GBank Promote", "Transfer, public-sweep, and stack merge finished successfully!", "success")
 end
 
 -- ─── Picked Deposit Engine ────────────────────────────────────────────────────
@@ -1188,6 +1259,7 @@ local function processBankWorkflow()
             isRunningWorkflow = false
             pendingPrune      = false
             pendingPromote    = false
+            pendingMerge      = false
             workflowStep      = 0
             return
         end
@@ -1204,6 +1276,12 @@ local function processBankWorkflow()
             workflowStep      = 0
             isPromoting       = true
             notify("GBank Promote", "Bank open. Starting public-access sweep...", "officer")
+        elseif pendingMerge then
+            pendingMerge      = false
+            isRunningWorkflow = false
+            workflowStep      = 0
+            isMerging         = true
+            notify("GBank Merge", "Bank open. Starting stack merge sweep...", "officer")
         elseif selectedOption == 1 then
             -- Both categories in GET mode: bank scan → picker
             scanBankForCategory()
@@ -1579,13 +1657,15 @@ local function mainGUI()
         end
 
         -- Officer-only action buttons
-        if cachedIsOfficer and not (isRunningWorkflow or isWithdrawingPicked or isDepositingPicked or isPruning or isPromoting) then
+        if cachedIsOfficer and not (isRunningWorkflow or isWithdrawingPicked or isDepositingPicked or isPruning or isPromoting or isMerging) then
+            ImGui.Separator()
             local pruneW   = 130
             local promoteW = 90
-            local spacing  = ImGui.GetStyle().ItemSpacing.x
-            local pairW    = pruneW + spacing + promoteW
-            local availW   = ImGui.GetContentRegionAvail()
-            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + (availW - pairW) * 0.5)
+            local mergeW   = 130
+            local sp       = ImGui.GetStyle().ItemSpacing.x
+            local winW     = ImGui.GetWindowWidth()
+            -- Row 1: PRUNE SPELLS centered
+            ImGui.SetCursorPosX((winW - pruneW) * 0.5)
             if ImGui.Button("PRUNE SPELLS", ImVec2(pruneW, 25)) then
                 if mq.TLO.Window('GuildBankWnd').Open() then
                     isPruning = true
@@ -1597,7 +1677,16 @@ local function mainGUI()
                     pendingPrune      = true
                 end
             end
+            -- Prune action selection
+            ImGui.Text("Prune action:")
             ImGui.SameLine()
+            if ImGui.RadioButton("Keep (autoinv)", pruneAction == 1) then pruneAction = 1 end
+            ImGui.SameLine()
+            if ImGui.RadioButton("Destroy", pruneAction == 2) then pruneAction = 2 end
+            -- Row 2: MERGE STACKS + PROMOTE centered
+            ImGui.Separator()
+            local row2W    = promoteW + sp + mergeW
+            ImGui.SetCursorPosX((winW - row2W) * 0.5)
             if ImGui.Button("PROMOTE", ImVec2(promoteW, 25)) then
                 if mq.TLO.Window('GuildBankWnd').Open() then
                     isPromoting = true
@@ -1608,12 +1697,17 @@ local function mainGUI()
                     pendingPromote    = true
                 end
             end
-            -- Prune action selection
-            ImGui.Text("Prune action:")
             ImGui.SameLine()
-            if ImGui.RadioButton("Keep (autoinv)", pruneAction == 1) then pruneAction = 1 end
-            ImGui.SameLine()
-            if ImGui.RadioButton("Destroy", pruneAction == 2) then pruneAction = 2 end
+            if ImGui.Button("MERGE STACKS", ImVec2(mergeW, 25)) then
+                if mq.TLO.Window('GuildBankWnd').Open() then
+                    isMerging = true
+                    notify("GBank Merge", "Starting stack merge sweep...", "officer")
+                else
+                    isRunningWorkflow = true
+                    workflowStep      = 1
+                    pendingMerge      = true
+                end
+            end
         end
 
         ImGui.Separator()
@@ -1633,13 +1727,14 @@ local function mainGUI()
 
         ImGui.Separator()
 
-        local isBusy = isRunningWorkflow or isWithdrawingPicked or isDepositingPicked or isPruning or isPromoting
+        local isBusy = isRunningWorkflow or isWithdrawingPicked or isDepositingPicked or isPruning or isPromoting or isMerging
 
         if isBusy then
             local label = isWithdrawingPicked and "CANCEL WITHDRAWAL"
                        or isDepositingPicked  and "CANCEL DEPOSIT"
                        or isPruning           and "CANCEL PRUNE"
                        or isPromoting         and "CANCEL PROMOTE"
+                       or isMerging           and "CANCEL MERGE"
                        or                        "CANCEL ACTION"
             local cancelW = 180
             ImGui.SetCursorPosX(ImGui.GetCursorPosX() + (ImGui.GetContentRegionAvail() - cancelW) * 0.5)
@@ -1650,8 +1745,10 @@ local function mainGUI()
                 isDepositingPicked  = false
                 isPruning          = false
                 isPromoting        = false
+                isMerging          = false
                 pendingPrune       = false
                 pendingPromote     = false
+                pendingMerge       = false
                 withdrawQueue      = {}
                 depositQueue       = {}
                 workflowStep       = 0
@@ -1724,8 +1821,10 @@ local function mainGUI()
             isDepositingPicked  = false
             isPruning          = false
             isPromoting        = false
+            isMerging          = false
             pendingPrune       = false
             pendingPromote     = false
+            pendingMerge       = false
             -- Close guild bank window if open
             if mq.TLO.Window('GuildBankWnd').Open() then
                 mq.TLO.Window('GuildBankWnd').DoClose()
@@ -1818,6 +1917,13 @@ while shouldDraw do
             notify("GBank Promote", "Aborted — not an officer.", "error")
         end
         isPromoting = false
+    elseif isMerging then
+        if cachedIsOfficer then
+            handleMergeStacks()
+        else
+            notify("GBank Merge", "Aborted — not an officer.", "error")
+            isMerging = false
+        end
     elseif isRunningWorkflow then
         processBankWorkflow()
     end
